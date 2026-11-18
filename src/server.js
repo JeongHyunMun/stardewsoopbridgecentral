@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { Store } from './store.js';
@@ -28,7 +29,14 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api')) res.set('Cache-Control', 'no-store');
   next();
 });
-app.use(express.static(path.resolve(root, '../public'), { index: 'index.html', etag: true, maxAge: '5m' }));
+// HTML은 캐시하지 않는다. 캐시되면 배포 후에도 옛 화면 코드가 남아 새 데이터 형식을 잘못 읽는다.
+app.use(express.static(path.resolve(root, '../public'), {
+  index: 'index.html', etag: true, maxAge: '5m',
+  setHeaders: (res, filePath) => { if (filePath.endsWith('.html')) res.set('Cache-Control', 'no-store'); }
+}));
+// 열려 있는 관리자 탭이 화면 코드가 바뀐 것을 알고 스스로 새로고침하도록 버전(파일 수정 시각)을 알려 준다.
+const adminHtmlPath = path.resolve(root, '../public/admin.html');
+const adminUiVersion = () => { try { return String(Math.floor(fs.statSync(adminHtmlPath).mtimeMs)); } catch { return null; } };
 
 const cookieName = 'ssb_session';
 const cookieOptions = `Path=/; HttpOnly; SameSite=Strict; Max-Age=43200${process.env.TRUST_PROXY === 'true' ? '; Secure' : ''}`;
@@ -100,7 +108,7 @@ const loginAttempts = new Map();
 app.post('/api/logout', auth, async (req, res) => { store.data.sessions = store.data.sessions.filter(s => s.tokenHash !== req.auth.session.tokenHash); await store.save(); await store.audit(req.auth.user.username, 'logout'); res.set('Set-Cookie', `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${process.env.TRUST_PROXY === 'true' ? '; Secure' : ''}`); res.json({ ok: true }); });
 app.get('/api/admin/overview', auth, adminOnly, (req, res) => {
   const jobs = store.data.jobs;
-  res.json({ ok: true, counts: { streamers: store.data.streamers.filter(s => s.active).length, pending: jobs.filter(j => ['PENDING','RETRY'].includes(j.status)).length, leased: jobs.filter(j => j.status === 'LEASED').length, review: jobs.filter(j => j.status === 'REVIEW').length, completed: jobs.filter(j => j.status === 'COMPLETED').length, donations: store.data.donations.length }, jobs: jobs.slice(0, 100).map(publicJob), streamers: store.data.streamers.map(publicStreamer), audit: store.data.audit.slice(0, 50), users: req.auth.user.role === 'owner' ? store.data.users.map(publicUser) : [] });
+  res.json({ ok: true, uiVersion: adminUiVersion(), counts: { streamers: store.data.streamers.filter(s => s.active).length, pending: jobs.filter(j => ['PENDING','RETRY'].includes(j.status)).length, leased: jobs.filter(j => j.status === 'LEASED').length, review: jobs.filter(j => j.status === 'REVIEW').length, completed: jobs.filter(j => j.status === 'COMPLETED').length, donations: store.data.donations.length }, jobs: jobs.slice(0, 100).map(publicJob), streamers: store.data.streamers.map(publicStreamer), audit: store.data.audit.slice(0, 50), users: req.auth.user.role === 'owner' ? store.data.users.map(publicUser) : [] });
 });
 app.post('/api/admin/streamers', auth, ownerOnly, async (req, res) => {
   const soopId = String(req.body?.soopId || '').trim().slice(0, 100);
@@ -217,7 +225,7 @@ app.post('/api/agent/ack', async (req, res) => {
   await store.save(); await store.audit(`agent:${streamer.soopId}`, 'job_acknowledged', { jobId: job.id, status: result, message: job.lastError }); res.json({ ok: true });
 });
 
-app.get('/admin', (_req, res) => res.sendFile(path.resolve(root, '../public/admin.html')));
+app.get('/admin', (_req, res) => { res.set('Cache-Control', 'no-store'); res.sendFile(adminHtmlPath); });
 app.get('/api/admin/users', auth, ownerOnly, (_req, res) => res.json({ ok: true, users: store.data.users.map(publicUser) }));
 app.use((err, _req, res, _next) => { console.error('[server error]', err?.stack || err); fail(res, 500, '서버 내부 오류가 발생했습니다. 서버 로그를 확인하세요.'); });
 app.listen(port, host, () => console.log(`[StardewSOOPBridge Central] listening on http://${host}:${port}; admin page: /admin; health: /health`));
