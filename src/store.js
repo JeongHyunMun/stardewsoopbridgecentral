@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const initial = () => ({ version: 1, users: [], streamers: [], jobs: [], donations: [], audit: [], sessions: [] });
+const initial = () => ({ version: 1, users: [], gameServers: [], streamers: [], jobs: [], donations: [], audit: [], sessions: [] });
 export class Store {
   constructor(dir) { this.dir = path.resolve(dir); this.file = path.join(this.dir, 'db.json'); this.data = initial(); this.chain = Promise.resolve(); }
   async init() {
