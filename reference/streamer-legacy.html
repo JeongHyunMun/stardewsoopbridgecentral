@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stardew SOOP Bridge</title>
+  <script src="https://static.sooplive.com/asset/app/chat-sdk/sooplive-chat-sdk.js"></script>
+  <style>
+    :root{color-scheme:light dark}body{font-family:system-ui,sans-serif;max-width:820px;margin:36px auto;padding:0 18px;line-height:1.6}main{border:1px solid #8885;border-radius:14px;padding:24px}.status{padding:12px;border-radius:8px;background:#8882;white-space:pre-wrap;overflow-wrap:anywhere}.actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0}button{font:inherit;padding:10px 15px;border-radius:8px;border:1px solid #888;cursor:pointer}button:disabled{opacity:.5;cursor:wait}code{overflow-wrap:anywhere}ul{padding-left:22px}.small{font-size:.92rem;opacity:.85}form.admin{display:grid;gap:10px;max-width:520px}form.admin input,form.admin select{font:inherit;padding:9px;border-radius:7px;border:1px solid #888}form.admin button{justify-self:start}.warning{font-size:.9rem;opacity:.85}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Stardew SOOP Bridge</h1>
+  <p id="status" class="status">설정과 SDK를 확인하는 중입니다…</p>
+  <div class="actions">
+    <button id="authBtn">SOOP 로그인 / 인증</button>
+    <button id="connectBtn" disabled>채팅 연결</button>
+    <button id="disconnectBtn" disabled>연결 해제</button>
+    <button id="logoutBtn">저장된 인증 삭제</button>
+  </div>
+  <h2>연결 정보</h2>
+  <ul>
+    <li>상태: <strong id="connection">연결 안 됨</strong></li>
+    <li>인증 계정 ID: <code id="accountId">-</code></li>
+    <li>방송 ID (bjId): <code id="bjId">-</code></li>
+    <li>채팅방 번호: <code id="chatNumber">-</code></li>
+  </ul>
+  <hr>
+  <h2>관리자 수동 지급</h2>
+  <p class="warning">API 누락 또는 지급 누락을 보정할 때 사용합니다. 승인된 SOOP 계정 ID(bjId)만 대상으로 하며, 관리자 비밀번호는 서버의 <code>ADMIN_TOKEN</code> 값입니다.</p>
+  <form id="adminGrantForm" class="admin">
+    <label>관리자 비밀번호 <input id="adminToken" type="password" autocomplete="current-password" required></label>
+    <label>SOOP 방송 ID (bjId) <input id="grantSoopId" required maxlength="100" placeholder="예: streamer_id"></label>
+    <label>지급 종류 <select id="grantType"><option value="chest">보상 상자</option><option value="monster">몬스터 소환</option></select></label>
+    <label>수량 <input id="grantAmount" type="number" min="1" max="1000" value="1" required></label>
+    <label>지급 사유 <input id="grantReason" maxlength="200" value="누락 후원 보정"></label>
+    <button type="submit" id="grantSubmit">수동 지급 요청</button>
+    <pre id="grantStatus" class="status">관리자 인증 후 지급 요청을 보낼 수 있습니다.</pre>
+  </form>
+  <h2>최근 기록</h2><pre id="log" class="status">프로그램 시작</pre>
+  <h2>필요한 설정</h2>
+  <p>이 버전은 스트리머마다 각자의 PC에서 실행합니다. 공통 SOOP 앱의 Client ID/Secret과 해당 PC의 스타듀밸리 브리지 URL/토큰을 <code>.env</code>에 설정하세요. <code>SOOP_STREAMER_ID</code>는 더 이상 필요하지 않습니다.</p>
+  <p class="small">브라우저 인증은 이 브라우저의 로컬 저장소에 저장됩니다. 이 페이지 또는 로컬 브리지 서버를 닫으면 후원 수신도 중단됩니다. 이 로컬용 버전을 그대로 공개 웹사이트에 배포하지 마세요.</p>
+  <p>서버 상태: <a href="/health">/health</a></p>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const log = (message) => {
+    const stamp = new Date().toLocaleTimeString();
+    $('log').textContent = `[${stamp}] ${message}\n` + $('log').textContent.slice(0, 4500);
+  };
+  const status = (message) => { $('status').textContent = message; log(message); };
+
+  let config = null;
+  let chat = null;
+  let connected = false;
+  let connecting = false;
+  let activeStreamerId = '';
+  let authenticatedAccountId = '';
+  let activeChatNumber = null;
+
+  // OAuth 응답/SDK 응답은 SDK 버전에 따라 필드명이 다를 수 있으므로
+  // 알려진 ID 필드만 확인하고 access_token/secret 등은 로그에 남기지 않는다.
+  function extractAccountId(value) {
+    if (!value || typeof value !== 'object') return '';
+    const candidates = [
+      value.bjId, value.bj_id, value.userId, value.user_id, value.userID,
+      value.accountId, value.account_id, value.memberId, value.member_id, value.id,
+      value.user?.bjId, value.user?.userId, value.user?.user_id, value.user?.id,
+      value.data?.bjId, value.data?.userId, value.data?.user_id, value.data?.id,
+      value.profile?.bjId, value.profile?.userId, value.profile?.id
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+      if (typeof candidate === 'number' && Number.isFinite(candidate)) return String(candidate);
+    }
+    return '';
+  }
+
+  function normalizeRoomInfo(room) {
+    if (!room || typeof room !== 'object') return { bjId: '', chatNumber: null };
+    const nested = room.data && typeof room.data === 'object' ? room.data : room;
+    const bjId = String(nested.bjId || nested.bj_id || nested.userId || nested.user_id || room.bjId || room.bj_id || '').trim();
+    const rawNumber = nested.chatNumber ?? nested.chatNo ?? nested.chat_number ?? nested.chNo ?? room.chatNumber ?? room.chatNo ?? null;
+    const chatNumber = rawNumber === null || rawNumber === undefined || rawNumber === '' ? null : rawNumber;
+    return { bjId, chatNumber, raw: room };
+  }
+
+  async function loadConfig() {
+    const response = await fetch('/config', { cache: 'no-store' });
+    if (!response.ok) throw new Error('로컬 서버 설정을 읽지 못했습니다. .env 설정을 확인하세요.');
+    config = await response.json();
+    if (!config.clientId || !config.clientSecret) {
+      throw new Error('.env에 SOOP_CLIENT_ID와 SOOP_CLIENT_SECRET을 입력하세요.');
+    }
+    if (!window.SOOP || typeof window.SOOP.ChatSDK !== 'function') {
+      throw new Error('SOOP Chat SDK를 불러오지 못했습니다. 인터넷 연결 또는 SDK CDN을 확인하세요.');
+    }
+  }
+
+  function createChat() {
+    if (chat) return;
+    chat = new window.SOOP.ChatSDK(config.clientId, config.clientSecret);
+
+    chat.handleError?.((code, message) => {
+      log(`SOOP SDK 오류 ${code}: ${message || '상세 메시지 없음'}`);
+      // SDK may emit a late informational error while connect() is resolving.
+      // Don't overwrite the connected UI if the connection is already active.
+      if (!connected && !connecting) $('connection').textContent = '오류';
+    });
+
+    chat.handleChatClosed?.(() => {
+      connected = false;
+      activeStreamerId = '';
+      activeChatNumber = null;
+      $('connection').textContent = '연결 종료';
+      $('accountId').textContent = authenticatedAccountId || '-';
+      $('bjId').textContent = '-';
+      $('chatNumber').textContent = '-';
+      $('connectBtn').disabled = !localStorage.getItem('soop_access_token');
+      $('disconnectBtn').disabled = true;
+      log('SOOP 채팅 연결이 종료되었습니다.');
+    });
+
+    chat.handleMessageReceived((action, message) => {
+      if (action === 'LOGIN') log('SOOP 채팅 로그인 이벤트 수신');
+      if (action !== 'BALLOON_GIFTED') return;
+
+      const balloons = Number(message?.count);
+      const soopId = String(message?.bjId || activeStreamerId || '').trim();
+      if (!Number.isSafeInteger(balloons) || balloons <= 0 || !soopId) {
+        log('별풍선 이벤트에 유효한 수량 또는 방송 ID가 없어 무시했습니다.');
+        return;
+      }
+
+      // 후원 payload의 bjId는 실제 방송에서 발생한 이벤트의 방송 ID다.
+      // SDK의 getRoomInfo()가 ID를 주지 않는 경우 이 값을 동적으로 채택한다.
+      if (message?.bjId) {
+        activeStreamerId = String(message.bjId).trim();
+        $('bjId').textContent = activeStreamerId;
+      }
+      const donation = {
+        eventId: (window.crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+        soopId,
+        balloons,
+        userId: String(message?.userId || ''),
+        userNickname: String(message?.userNickname || '')
+      };
+      log(`별풍선 이벤트: ${donation.userNickname || donation.userId || '알 수 없는 후원자'} / ${balloons}개 전달 중 (방송 ${soopId})`);
+
+      fetch('/event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(donation)
+      }).then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        log(`스타듀밸리 브리지 전달 성공 (${balloons}개, ${soopId})`);
+      }).catch((error) => log(`스타듀밸리 전달 실패: ${error?.message || error}`));
+    });
+  }
+
+  async function connectWithToken(accessToken) {
+    if (connecting || connected) return;
+    connecting = true;
+    $('connectBtn').disabled = true;
+    try {
+      await loadConfig();
+      createChat();
+      chat.setAuth(accessToken);
+      $('connection').textContent = '연결 중';
+      status('SOOP 채팅 서버에 연결 중…');
+      const result = await chat.connect();
+
+      let room = null;
+      try {
+        // SDK versions may return either a Promise or a direct value.
+        room = await Promise.resolve(chat.getRoomInfo());
+      } catch (error) {
+        log(`방송 정보 조회 실패: ${error?.message || error}`);
+      }
+
+      const normalizedRoom = normalizeRoomInfo(room);
+      activeStreamerId = normalizedRoom.bjId || authenticatedAccountId;
+      activeChatNumber = normalizedRoom.chatNumber;
+      connected = true;
+      $('connection').textContent = (activeStreamerId && activeChatNumber !== null && String(activeChatNumber) !== '0') ? '연결됨' : 'SDK 연결 응답 / 방송 정보 미확인';
+      $('accountId').textContent = authenticatedAccountId || '(OAuth 응답에서 계정 ID 미제공)';
+      $('bjId').textContent = normalizedRoom.bjId || '(SDK에서 방송 ID를 반환하지 않음)';
+      $('chatNumber').textContent = activeChatNumber ?? '-';
+      log(`getRoomInfo() 필드: ${Object.keys(normalizedRoom.raw || {}).join(', ') || '(응답 없음)'}`);
+      if (!normalizedRoom.bjId) log('참고: 인증 응답에서 계정 ID가 확인되지 않았습니다. 후원 이벤트의 bjId가 수신될 때까지 실제 방송 ID는 확정할 수 없습니다.');
+      $('disconnectBtn').disabled = false;
+      $('connectBtn').disabled = true;
+      status(normalizedRoom.bjId && activeChatNumber !== null && String(activeChatNumber) !== '0'
+        ? `SOOP 채팅방 정보 확인 완료. 방송 ${normalizedRoom.bjId}의 후원 이벤트를 기다리는 중입니다.`
+        : 'SDK connect()는 완료됐지만 방송 ID/채팅방 번호를 검증하지 못했습니다. 실제 후원 이벤트가 수신되는지 확인이 필요합니다.');
+      log(`connect() 완료: ${JSON.stringify(result ?? {})}`);
+    } catch (error) {
+      connected = false;
+      $('connection').textContent = '오류';
+      $('connectBtn').disabled = false;
+      $('disconnectBtn').disabled = true;
+      status(`채팅 연결 실패: ${error?.message || error}`);
+    } finally {
+      connecting = false;
+    }
+  }
+
+  $('authBtn').addEventListener('click', async () => {
+    try {
+      await loadConfig();
+      createChat();
+      status('SOOP 로그인 페이지를 여는 중입니다…');
+      chat.openAuth();
+    } catch (error) {
+      status(error?.message || String(error));
+    }
+  });
+
+  $('connectBtn').addEventListener('click', async () => {
+    const token = localStorage.getItem('soop_access_token');
+    if (!token) { status('먼저 SOOP 로그인 / 인증을 진행하세요.'); return; }
+    await connectWithToken(token);
+  });
+
+  $('disconnectBtn').addEventListener('click', async () => {
+    try { await chat?.disconnect(); } catch (error) { log(`연결 해제 오류: ${error?.message || error}`); }
+    connected = false;
+    activeStreamerId = '';
+    activeChatNumber = null;
+    $('connection').textContent = '연결 안 됨';
+    $('accountId').textContent = authenticatedAccountId || '-';
+    $('bjId').textContent = '-';
+    $('chatNumber').textContent = '-';
+    $('connectBtn').disabled = !localStorage.getItem('soop_access_token');
+    $('disconnectBtn').disabled = true;
+    status('SOOP 채팅 연결을 해제했습니다.');
+  });
+
+  $('logoutBtn').addEventListener('click', async () => {
+    try { if (connected) await chat?.disconnect(); } catch {}
+    connected = false;
+    activeStreamerId = '';
+    localStorage.removeItem('soop_access_token');
+    localStorage.removeItem('soop_refresh_token');
+    localStorage.removeItem('soop_account_id');
+    $('connection').textContent = '연결 안 됨';
+    $('accountId').textContent = '-';
+    $('bjId').textContent = '-';
+    $('chatNumber').textContent = '-';
+    authenticatedAccountId = '';
+    $('connectBtn').disabled = true;
+    $('disconnectBtn').disabled = true;
+    status('이 브라우저에 저장된 SOOP 인증 정보를 삭제했습니다.');
+  });
+
+  $('adminGrantForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = $('grantSubmit');
+    button.disabled = true;
+    $('grantStatus').textContent = '관리자 지급 요청을 전송하는 중…';
+    try {
+      const response = await fetch('/admin/grant', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': $('adminToken').value },
+        body: JSON.stringify({
+          soopId: $('grantSoopId').value.trim(),
+          rewardType: $('grantType').value,
+          amount: Number($('grantAmount').value),
+          reason: $('grantReason').value.trim()
+        })
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      $('grantStatus').textContent = `요청 전달 완료\n대상: ${result.soopId}\n종류: ${result.rewardType}\n수량: ${result.amount}\n요청 ID: ${result.grantId}\n\n게임 내 실제 지급 여부는 SMAPI 로그에서 확인하세요.`;
+      log(`관리자 수동 지급 전달: ${result.soopId} / ${result.rewardType} x${result.amount} / ${result.grantId}`);
+    } catch (error) {
+      $('grantStatus').textContent = `실패: ${error?.message || error}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  (async () => {
+    try {
+      await loadConfig();
+      $('accountId').textContent = '-';
+      const url = new URL(location.href);
+      const code = url.searchParams.get('code') || url.searchParams.get('authCode');
+      if (code) {
+        createChat();
+        status('SOOP 인증 코드를 토큰으로 교환 중…');
+        const tokens = await chat.getAuth(code);
+        if (!tokens?.access_token) throw new Error('getAuth() 응답에 access_token이 없습니다.');
+        authenticatedAccountId = extractAccountId(tokens);
+        if (authenticatedAccountId) localStorage.setItem('soop_account_id', authenticatedAccountId);
+        else localStorage.removeItem('soop_account_id');
+        $('accountId').textContent = authenticatedAccountId || '(OAuth 응답에서 계정 ID 미제공)';
+        log(`OAuth 응답 필드: ${Object.keys(tokens).filter((key) => !/token|secret|code|key/i.test(key)).join(', ') || '(ID 필드 없음)'}`);
+        if (authenticatedAccountId) log(`OAuth 응답에서 계정 ID 확인: ${authenticatedAccountId}`);
+        else log('OAuth 응답에 알려진 계정 ID 필드가 없습니다. access_token 값 자체는 보안상 표시하지 않습니다.');
+        localStorage.setItem('soop_access_token', tokens.access_token);
+        if (tokens.refresh_token) localStorage.setItem('soop_refresh_token', tokens.refresh_token);
+        url.searchParams.delete('code');
+        url.searchParams.delete('authCode');
+        history.replaceState({}, '', url.pathname + url.search + url.hash);
+        $('connectBtn').disabled = false;
+        status('SOOP 인증 성공. 채팅 연결을 시작합니다.');
+        await connectWithToken(tokens.access_token);
+      } else {
+        const savedToken = localStorage.getItem('soop_access_token');
+        authenticatedAccountId = localStorage.getItem('soop_account_id') || '';
+        $('accountId').textContent = authenticatedAccountId || '-';
+        if (savedToken) {
+          $('connectBtn').disabled = false;
+          status('이 브라우저에 저장된 SOOP 인증으로 연결을 시도합니다…');
+          await connectWithToken(savedToken);
+        } else {
+          $('connectBtn').disabled = true;
+          status('준비 완료. SOOP 로그인 / 인증 버튼을 눌러주세요.');
+        }
+      }
+    } catch (error) {
+      $('connection').textContent = '오류';
+      status(`초기화 실패: ${error?.message || error}`);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

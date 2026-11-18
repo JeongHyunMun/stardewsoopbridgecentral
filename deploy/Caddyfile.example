@@ -1,0 +1,7 @@
+# Replace bridge.example.kr with your actual Korean domain.
+# Caddy obtains and renews a trusted HTTPS certificate automatically when
+# DNS points to this PC and ports 80/443 are reachable from the internet.
+bridge.example.kr {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3000
+}
