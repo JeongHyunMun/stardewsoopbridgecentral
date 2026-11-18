@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { Store } from './store.js';
 import { randomToken, hashToken, safeEqual, hashPassword, verifyPassword } from './security.js';
+import { RulesProvider, computeRewards } from './rewards.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -14,6 +15,8 @@ const dataDir = process.env.DATA_DIR || path.resolve(root, '../data');
 const sessionSecret = process.env.SESSION_SECRET || '';
 const ingestToken = process.env.DONATION_INGEST_TOKEN || '';
 const store = await new Store(dataDir).init();
+// 보상 규칙(config/rules.json). 파일을 수정하면 재시작 없이 다음 후원부터 반영된다.
+const rules = new RulesProvider(process.env.RULES_FILE || path.resolve(root, '../config/rules.json'));
 if (process.env.TRUST_PROXY === 'true') app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
@@ -162,12 +165,10 @@ app.post('/api/ingest/donation', async (req, res) => {
   const donation = { id: crypto.randomUUID(), eventId, soopId, balloons, receivedAt: new Date().toISOString(), status: streamer ? 'RECORDED' : 'UNLINKED' };
   store.data.donations.unshift(donation);
   if (streamer) {
-    let rewardType = null, amount = 0;
-    // Production thresholds: 33 -> one monster; 100 -> one chest; exactly 1000 -> eleven chests.
-    if (balloons === 1000) { rewardType = 'chest'; amount = 11; }
-    else if (balloons >= 100 && balloons < 1000) { rewardType = 'chest'; amount = Math.floor(balloons / 100); }
-    if (rewardType) store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, streamerLabel: streamer.label, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: 'soop-ingest' });
-    if (balloons >= 33) store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, streamerLabel: streamer.label, soopId: streamer.soopId, farmerName: '', rewardType: 'monster', amount: 1, reason: `후원 자동 보상: ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: 'soop-ingest' });
+    // 지급 기준은 config/rules.json에서 읽는다 (수정하면 재시작 없이 반영).
+    for (const { rewardType, amount } of computeRewards(rules.get(), balloons)) {
+      store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, streamerLabel: streamer.label, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: 'soop-ingest' });
+    }
   }
   await store.save(); await store.audit('soop-ingest', 'donation_received', { eventId, soopId, balloons, status: donation.status }); res.status(201).json({ ok: true, donationId: donation.id, status: donation.status });
 });

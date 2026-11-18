@@ -1,0 +1,7 @@
+{
+  "rules": [
+    { "name": "monster-33", "type": "monster", "minBalloons": 33, "amount": 1 },
+    { "name": "chest-per-100", "type": "chest", "minBalloons": 100, "maxBalloons": 999, "perBalloons": 100 },
+    { "name": "chest-1000", "type": "chest", "exactBalloons": 1000, "amount": 11 }
+  ]
+}
