@@ -51,7 +51,7 @@ function auth(req, res, next) {
 function adminOnly(req, res, next) { if (!req.auth || !['owner', 'operator'].includes(req.auth.user.role)) return fail(res, 403, '관리자 권한이 필요합니다.'); next(); }
 function ownerOnly(req, res, next) { if (!req.auth || req.auth.user.role !== 'owner') return fail(res, 403, '최고 관리자만 사용할 수 있습니다.'); next(); }
 function publicUser(u) { return { id: u.id, username: u.username, displayName: u.displayName, role: u.role, active: u.active, createdAt: u.createdAt }; }
-function publicStreamer(s) { return { id: s.id, label: s.label, soopId: s.soopId, active: s.active, pairedAt: s.pairedAt, lastSeenAt: s.lastSeenAt || null }; }
+function publicStreamer(s) { return { id: s.id, label: s.label, soopId: s.soopId, farmerId: s.farmerId || null, active: s.active, pairedAt: s.pairedAt, lastSeenAt: s.lastSeenAt || null }; }
 function publicJob(j) { return { id: j.id, streamerId: j.streamerId, streamerLabel: j.streamerLabel, soopId: j.soopId, farmerName: j.farmerName, rewardType: j.rewardType, amount: j.amount, reason: j.reason, source: j.source, status: j.status, createdAt: j.createdAt, updatedAt: j.updatedAt, completedAt: j.completedAt || null, attempts: j.attempts, lastError: j.lastError || null, createdBy: j.createdBy }; }
 
 async function ensureOwner() {
@@ -97,16 +97,27 @@ app.get('/api/admin/overview', auth, adminOnly, (req, res) => {
 });
 app.post('/api/admin/streamers', auth, ownerOnly, async (req, res) => {
   const label = String(req.body?.label || '').trim().slice(0, 80); const soopId = String(req.body?.soopId || '').trim().slice(0, 100);
+  const farmerId = req.body?.farmerId !== undefined && req.body?.farmerId !== '' ? String(req.body.farmerId).trim() : null;
   if (!label || !/^[A-Za-z0-9_.-]{2,100}$/.test(soopId)) return fail(res, 400, '표시 이름과 올바른 SOOP 방송 ID가 필요합니다.');
+  if (farmerId !== null && !/^\d+$/.test(farmerId)) return fail(res, 400, 'FarmerId는 숫자여야 합니다.');
   if (store.data.streamers.some(s => s.soopId.toLowerCase() === soopId.toLowerCase())) return fail(res, 409, '이미 등록된 SOOP 방송 ID입니다.');
-  const token = randomToken(32); const streamer = { id: crypto.randomUUID(), label, soopId, tokenHash: hashToken(token), active: true, pairedAt: new Date().toISOString(), createdBy: req.auth.user.username };
-  store.data.streamers.push(streamer); await store.save(); await store.audit(req.auth.user.username, 'streamer_paired', { streamerId: streamer.id, soopId });
+  const token = randomToken(32); const streamer = { id: crypto.randomUUID(), label, soopId, farmerId: farmerId || null, tokenHash: hashToken(token), active: true, pairedAt: new Date().toISOString(), createdBy: req.auth.user.username };
+  store.data.streamers.push(streamer); await store.save(); await store.audit(req.auth.user.username, 'streamer_paired', { streamerId: streamer.id, soopId, farmerId });
   res.status(201).json({ ok: true, streamer: publicStreamer(streamer), agentToken: token, warning: '이 토큰은 지금 한 번만 표시됩니다. 스트리머 SMAPI 모드의 config.json에 안전하게 입력하세요.' });
 });
 app.patch('/api/admin/streamers/:id', auth, ownerOnly, async (req, res) => {
   const s = store.data.streamers.find(x => x.id === req.params.id); if (!s) return fail(res, 404, '방송을 찾을 수 없습니다.');
-  s.active = Boolean(req.body?.active); if (!s.active) for (const j of store.data.jobs) if (j.streamerId === s.id && ['PENDING','RETRY','LEASED'].includes(j.status)) { j.status = 'REVIEW'; j.lastError = '방송 연결이 관리자에 의해 비활성화됨'; j.updatedAt = new Date().toISOString(); }
-  await store.save(); await store.audit(req.auth.user.username, 'streamer_active_changed', { streamerId: s.id, active: s.active }); res.json({ ok: true, streamer: publicStreamer(s) });
+  if (req.body?.active !== undefined) {
+    s.active = Boolean(req.body.active);
+    if (!s.active) for (const j of store.data.jobs) if (j.streamerId === s.id && ['PENDING','RETRY','LEASED'].includes(j.status)) { j.status = 'REVIEW'; j.lastError = '방송 연결이 관리자에 의해 비활성화됨'; j.updatedAt = new Date().toISOString(); }
+  }
+  if (req.body?.farmerId !== undefined) {
+    const farmerId = String(req.body.farmerId).trim();
+    if (farmerId !== '' && !/^\d+$/.test(farmerId)) return fail(res, 400, 'FarmerId는 숫자여야 합니다.');
+    s.farmerId = farmerId || null;
+    await store.audit(req.auth.user.username, 'streamer_farmerid_updated', { streamerId: s.id, farmerId: s.farmerId });
+  }
+  await store.save(); await store.audit(req.auth.user.username, 'streamer_updated', { streamerId: s.id, active: s.active }); res.json({ ok: true, streamer: publicStreamer(s) });
 });
 app.post('/api/admin/operators', auth, ownerOnly, async (req, res) => {
   const username = String(req.body?.username || '').trim(); const password = String(req.body?.password || ''); const displayName = String(req.body?.displayName || username).trim().slice(0, 80);
@@ -171,7 +182,7 @@ app.post('/api/agent/poll', async (req, res) => {
   const job = store.data.jobs.find(j => j.streamerId === streamer.id && j.status === 'PENDING');
   if (!job) { await store.save(); return res.json({ ok: true, job: null, serverTime: new Date().toISOString() }); }
   job.status = 'LEASED'; job.attempts += 1; job.leaseUntil = new Date(now + 120000).toISOString(); job.updatedAt = new Date().toISOString(); await store.save();
-  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, serverTime: new Date().toISOString() });
+  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId || null, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, serverTime: new Date().toISOString() });
 });
 app.post('/api/agent/ack', async (req, res) => {
   const token = String(req.get('X-Agent-Token') || ''); const streamer = store.data.streamers.find(s => s.active && safeEqual(s.tokenHash, hashToken(token)));
