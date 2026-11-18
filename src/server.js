@@ -142,19 +142,45 @@ async function migrateToGameServers() {
   console.log(`[이전] 방송별 토큰 ${legacy.length}개를 게임 서버로 옮겼습니다. 백업: ${backup}`);
 }
 
-async function ensureOwner() {
-  const username = process.env.ADMIN_USERNAME || '';
-  const password = process.env.ADMIN_PASSWORD || '';
-  if (!sessionSecret || sessionSecret.length < 32) throw new Error('SESSION_SECRET을 32자 이상의 무작위 비밀값으로 설정하세요.');
-  if (!username || !password || password.startsWith('CHANGE_ME')) throw new Error('ADMIN_USERNAME과 강력한 ADMIN_PASSWORD를 .env에 설정하세요.');
-  if (!store.data.users.some(u => u.role === 'owner')) {
-    const p = await hashPassword(password);
-    store.data.users.push({ id: crypto.randomUUID(), username, displayName: '최고 관리자', role: 'owner', active: true, password: p, createdAt: nowIso() });
-    await store.audit('system', 'owner_bootstrapped', { username });
-    console.log(`[보안] 최초 최고 관리자 계정을 만들었습니다: ${username}`);
+// 최고 관리자 아이디/비밀번호는 config/admin.json에서 관리한다 (git에 올라가지 않음).
+// 파일을 고치면 재시작 없이 몇 초 안에 반영되고, 바뀌면 기존 최고 관리자 로그인은 풀린다.
+const adminConfigFile = process.env.ADMIN_CONFIG_FILE || path.resolve(root, '../config/admin.json');
+let adminConfigMtime = -1;
+async function syncOwnerFromConfig() {
+  if (!fs.existsSync(adminConfigFile)) {
+    const seed = { username: process.env.ADMIN_USERNAME || 'admin', password: process.env.ADMIN_PASSWORD || randomToken(9) };
+    fs.writeFileSync(adminConfigFile, JSON.stringify(seed, null, 2) + '\n', 'utf8');
+    console.log(`[보안] ${adminConfigFile}을 만들었습니다. 이 파일에서 최고 관리자 아이디/비밀번호를 바꾸세요.`);
   }
+  const mtime = fs.statSync(adminConfigFile).mtimeMs;
+  if (mtime === adminConfigMtime) return;
+  adminConfigMtime = mtime;
+  let username, password;
+  try {
+    const raw = JSON.parse(fs.readFileSync(adminConfigFile, 'utf8').replace(/^\uFEFF/, ''));
+    username = String(raw.username ?? '').trim(); password = String(raw.password ?? '');
+    if (!username || !password) throw new Error('username과 password를 모두 적어야 합니다.');
+  } catch (error) { console.error(`[보안] admin.json 오류, 이전 계정 유지: ${error.message}`); return; }
+  if (password.length < 8) console.warn('[보안] 최고 관리자 비밀번호가 8자보다 짧습니다. 길게 바꾸는 것을 권장합니다.');
+  const clash = store.data.users.find(u => u.role !== 'owner' && u.username.toLowerCase() === username.toLowerCase());
+  if (clash) { console.error(`[보안] admin.json의 아이디 "${username}"는 운영진 계정이 이미 쓰고 있어 반영하지 않았습니다.`); return; }
+  let owner = store.data.users.find(u => u.role === 'owner');
+  if (!owner) {
+    owner = { id: crypto.randomUUID(), username, displayName: '최고 관리자', role: 'owner', active: true, password: await hashPassword(password), createdAt: nowIso() };
+    store.data.users.push(owner);
+    await store.save(); await store.audit('system', 'owner_bootstrapped', { username });
+    console.log(`[보안] 최고 관리자 계정을 만들었습니다: ${username}`);
+    return;
+  }
+  if (owner.username === username && owner.active && await verifyPassword(password, owner.password)) return;
+  owner.username = username; owner.active = true; owner.password = await hashPassword(password);
+  store.data.sessions = store.data.sessions.filter(s => s.userId !== owner.id);
+  await store.save(); await store.audit('system', 'owner_credentials_changed', { username });
+  console.log(`[보안] admin.json 반영: 최고 관리자 아이디/비밀번호를 바꿨습니다 (${username}). 다시 로그인하세요.`);
 }
-await ensureOwner();
+if (!sessionSecret || sessionSecret.length < 32) throw new Error('SESSION_SECRET을 32자 이상의 무작위 비밀값으로 설정하세요.');
+await syncOwnerFromConfig();
+setInterval(() => syncOwnerFromConfig().catch(e => console.error('[보안] admin.json 반영 실패:', e.message)), 3000).unref();
 await migrateToGameServers();
 if (!isSoopConfigured()) console.warn('[경고] .env에 SOOP_CLIENT_ID / SOOP_CLIENT_SECRET이 없어 게임 내 /숲로그인을 쓸 수 없습니다.');
 
