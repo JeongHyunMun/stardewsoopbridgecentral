@@ -8,6 +8,7 @@ import { Store } from './store.js';
 import { randomToken, hashToken, safeEqual, hashPassword, verifyPassword, createSecretBox } from './security.js';
 import { RulesProvider, computeRewards, REWARD_TYPES } from './rewards.js';
 import { soopConfig, isSoopConfigured, authorizeUrl, exchangeCode, refreshTokens } from './soop.js';
+import { CentralConfig } from './central-config.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -16,8 +17,12 @@ const host = process.env.HOST || '127.0.0.1';
 const dataDir = process.env.DATA_DIR || path.resolve(root, '../data');
 const sessionSecret = process.env.SESSION_SECRET || '';
 const ingestToken = process.env.DONATION_INGEST_TOKEN || '';
-// 스트리머 브라우저와 숨은 Edge가 접속할 이 서버의 주소. SOOP 앱의 Redirect URL은 `${publicBaseUrl}/oauth/callback`이어야 한다.
-const publicBaseUrl = (process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${port}`).replace(/\/+$/, '');
+// 인증 도메인(스트리머 브라우저와 숨은 Edge가 접속할 이 서버의 주소)은 config/central.json의 publicBaseUrl.
+// 파일을 고치면 재시작 없이 반영된다. SOOP 앱의 Redirect URL은 `${publicBaseUrl}/oauth/callback`이어야 한다.
+const centralConfig = new CentralConfig(process.env.CENTRAL_CONFIG_FILE || path.resolve(root, '../config/central.json'),
+  { publicBaseUrl: process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${port}` });
+const publicBaseUrl = () => centralConfig.get().publicBaseUrl;
+const linkCookieSecure = () => publicBaseUrl().startsWith('https://');
 const secure = process.env.TRUST_PROXY === 'true';
 const store = await new Store(dataDir).init();
 const tokenBox = createSecretBox(sessionSecret);
@@ -180,7 +185,7 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/logout', auth, async (req, res) => { store.data.sessions = store.data.sessions.filter(s => s.tokenHash !== req.auth.session.tokenHash); await store.save(); await store.audit(req.auth.user.username, 'logout'); res.set('Set-Cookie', `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`); res.json({ ok: true }); });
 app.get('/api/admin/overview', auth, adminOnly, (req, res) => {
   const jobs = store.data.jobs;
-  res.json({ ok: true, uiVersion: adminUiVersion(), soopConfigured: isSoopConfigured(), redirectUrl: `${publicBaseUrl}/oauth/callback`,
+  res.json({ ok: true, uiVersion: adminUiVersion(), soopConfigured: isSoopConfigured(), redirectUrl: `${publicBaseUrl()}/oauth/callback`,
     counts: { streamers: store.data.streamers.filter(s => s.active).length, pending: jobs.filter(j => ['PENDING','RETRY'].includes(j.status)).length, leased: jobs.filter(j => j.status === 'LEASED').length, review: jobs.filter(j => j.status === 'REVIEW').length, completed: jobs.filter(j => j.status === 'COMPLETED').length, donations: store.data.donations.length },
     jobs: jobs.slice(0, 100).map(publicJob), streamers: store.data.streamers.filter(s => !s.deleted).map(publicStreamer), servers: store.data.gameServers.map(publicServer),
     audit: store.data.audit.slice(0, 50), users: req.auth.user.role === 'owner' ? store.data.users.map(publicUser) : [] });
@@ -319,11 +324,13 @@ app.post('/api/agent/poll', async (req, res) => {
   // 연동 결과 알림은 한 번만 내려보낸다.
   const linkEvents = (server.linkEvents || []).map(({ farmerId, kind, message }) => ({ farmerId, kind, message }));
   server.linkEvents = [];
+  // 게임 모드가 저장해 둔 연결 페이지 주소 대신 현재 인증 도메인을 쓰도록 같이 알려 준다 (도메인을 바꿔도 다음 접속부터 따라감).
+  const publicBase = publicBaseUrl();
   const job = store.data.jobs.slice().reverse().find(j => j.status === 'PENDING' && mine.get(j.streamerId)?.farmerId);
-  if (!job) { await store.save(); return res.json({ ok: true, job: null, linkEvents, serverTime: nowIso() }); }
+  if (!job) { await store.save(); return res.json({ ok: true, job: null, linkEvents, publicBaseUrl: publicBase, serverTime: nowIso() }); }
   const streamer = mine.get(job.streamerId);
   job.status = 'LEASED'; job.attempts += 1; job.leaseUntil = new Date(now + 120000).toISOString(); job.updatedAt = nowIso(); await store.save();
-  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, linkEvents, serverTime: nowIso() });
+  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, linkEvents, publicBaseUrl: publicBase, serverTime: nowIso() });
 });
 app.post('/api/agent/ack', async (req, res) => {
   const server = agentServer(req);
@@ -356,7 +363,8 @@ app.post('/api/agent/link/start', async (req, res) => {
   const ticket = randomToken(24);
   Object.assign(s, { farmerName: farmerName || s.farmerName, linkKeyHash: hashToken(sessionKey), linkInstance: null, loginTicketHash: hashToken(ticket), loginTicketExpiresAt: new Date(Date.now() + LINK_TICKET_MS).toISOString() });
   await store.save(); await store.audit(`server:${server.label}`, 'link_started', { streamerId: s.id, farmerId, farmerName });
-  res.json({ ok: true, loginUrl: `${publicBaseUrl}/link/login?t=${ticket}`, pageUrl: `${publicBaseUrl}/link/page`, sessionKey });
+  const base = publicBaseUrl();
+  res.json({ ok: true, loginUrl: `${base}/link/login?t=${ticket}`, pageUrl: `${base}/link/page`, sessionKey });
 });
 
 // 게임에서 /숲로그아웃: 토큰과 개인정보를 지운다.
@@ -415,27 +423,28 @@ const findByTicket = ticket => {
 app.get('/link/login', (req, res) => {
   const ticket = String(req.query.t || '');
   const s = findByTicket(ticket);
-  if (!s) return res.status(410).send(page('연결 주소 만료', '<h1>연결 주소가 만료되었습니다</h1><p class="muted">게임 채팅창에서 <b>/숲로그인</b>을 다시 입력하세요.</p>'));
-  res.set('Set-Cookie', `${linkCookieName}=${encodeURIComponent(ticket)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${LINK_TICKET_MS / 1000}${secure ? '; Secure' : ''}`);
+  if (!s) return res.status(410).send(failPage());
+  res.set('Set-Cookie', `${linkCookieName}=${encodeURIComponent(ticket)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${LINK_TICKET_MS / 1000}${linkCookieSecure() ? '; Secure' : ''}`);
   res.send(page('SOOP 계정 연결', `<h1>SOOP 계정 연결</h1>
-<p>스타듀밸리 캐릭터 <b>${escapeHtml(s.farmerName || s.farmerId)}</b>에 SOOP 계정을 연결합니다.</p>
-<ul class="muted"><li>연결 이유: 내 방송의 별풍선 후원을 받아 이 게임 캐릭터에 보상을 지급하기 위해서입니다.</li>
-<li>사용하는 정보: SOOP ID, 닉네임, 후원 수량</li>
-<li>게임이 켜져 있는 동안 이 PC에서 숨은 브라우저가 내 방송 채팅에 연결됩니다.</li>
-<li>연결을 끊으려면 게임 채팅에 <b>/숲로그아웃</b>을 입력하세요. 연결 정보가 삭제됩니다.</li></ul>
+<p>별풍선 후원 보상을 게임 캐릭터에 지급하기 위해 SOOP 계정을 연결합니다.</p>
+<p class="muted">연결 해제: 게임 채팅에 /숲로그아웃</p>
 <a class="btn" href="${escapeHtml(authorizeUrl())}">SOOP으로 로그인</a>`));
 });
+
+// 스트리머 화면에는 결과만 보여 준다. 실패 이유는 게임 채팅(연동 실패 알림)과 관리자 감사 로그에만 남긴다.
+const successPage = () => page('인증 성공', '<h1>인증 성공</h1><p>이 창을 닫아도 됩니다.</p>');
+const failPage = () => page('인증 실패', '<h1>인증 실패</h1><p>게임 채팅에서 /숲로그인을 다시 해 주세요.</p>');
 
 app.get('/oauth/callback', async (req, res) => {
   const ticket = decodeURIComponent(readCookie(req, linkCookieName) || '');
   const code = String(req.query.code || req.query.authCode || '');
   const s = findByTicket(ticket);
-  res.set('Set-Cookie', `${linkCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`);
-  if (!s) return res.status(410).send(page('연결 실패', '<h1>연결 시간이 지났습니다</h1><p class="muted">게임 채팅창에서 <b>/숲로그인</b>을 다시 입력하세요.</p>'));
+  res.set('Set-Cookie', `${linkCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${linkCookieSecure() ? '; Secure' : ''}`);
+  if (!s) return res.status(410).send(failPage());
   if (!code) {
     pushLinkEvent(s, 'error', 'SOOP 연동 실패: SOOP 로그인이 취소되었습니다. 다시 하려면 /숲로그인을 입력하세요.');
     await store.save();
-    return res.status(400).send(page('연결 실패', '<h1>SOOP 로그인이 취소되었습니다</h1><p class="muted">다시 하려면 게임 채팅창에서 <b>/숲로그인</b>을 입력하세요.</p>'));
+    return res.status(400).send(failPage());
   }
   try {
     const t = await exchangeCode(code);
@@ -443,12 +452,12 @@ app.get('/oauth/callback', async (req, res) => {
     s.loginTicketHash = null; s.loginTicketExpiresAt = null; s.linkedAt = nowIso();
     pushLinkEvent(s, 'info', 'SOOP 로그인 완료. 방송 채팅에 연결하는 중입니다...');
     await store.save(); await store.audit('soop', 'soop_login_completed', { streamerId: s.id, farmerId: s.farmerId });
-    res.send(page('연결 완료', '<h1>SOOP 연결 완료</h1><p>이 창을 닫고 게임으로 돌아가세요.</p><p class="muted">잠시 후 게임 채팅창에 방송 연결 결과가 표시됩니다.</p>'));
+    res.send(successPage());
   } catch (error) {
     console.error('[SOOP 로그인]', error.message);
     pushLinkEvent(s, 'error', `SOOP 연동 실패: 로그인 처리 중 오류가 났습니다 (${error.message}). /숲로그인을 다시 해 주세요.`);
     await store.save(); await store.audit('soop', 'soop_login_failed', { streamerId: s.id, error: error.message });
-    res.status(502).send(page('연결 실패', `<h1>SOOP 연결에 실패했습니다</h1><p class="muted">${escapeHtml(error.message)}</p><p class="muted">게임 채팅창에서 <b>/숲로그인</b>을 다시 입력하세요.</p>`));
+    res.status(502).send(failPage());
   }
 });
 
@@ -566,4 +575,4 @@ app.post('/api/link/donation', async (req, res) => {
 app.get('/admin', (_req, res) => { res.set('Cache-Control', 'no-store'); res.sendFile(adminHtmlPath); });
 app.get('/api/admin/users', auth, ownerOnly, (_req, res) => res.json({ ok: true, users: store.data.users.map(publicUser) }));
 app.use((err, _req, res, _next) => { console.error('[server error]', err?.stack || err); fail(res, 500, '서버 내부 오류가 발생했습니다. 서버 로그를 확인하세요.'); });
-app.listen(port, host, () => console.log(`[StardewSOOPBridge Central] listening on http://${host}:${port}; public: ${publicBaseUrl}; admin page: /admin; health: /health`));
+app.listen(port, host, () => console.log(`[StardewSOOPBridge Central] listening on http://${host}:${port}; 인증 도메인: ${publicBaseUrl()} (config/central.json); admin page: /admin; health: /health`));

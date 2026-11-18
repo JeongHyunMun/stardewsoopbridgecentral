@@ -8,16 +8,15 @@
   <style>body{font-family:system-ui,sans-serif;background:#0e131b;color:#edf3fa;margin:16px;font-size:13px}pre{white-space:pre-wrap;color:#9aaec4}</style>
 </head>
 <body>
-<b>SOOP 연결 (게임이 띄운 창입니다. 닫지 마세요)</b>
-<div id="state">시작 중…</div>
-<pre id="log"></pre>
+<div id="state">SOOP 연결 중…</div>
 <script>
 (() => {
   // 게임 모드가 이 페이지를 숨은 Edge로 연다. 세션 키는 주소의 # 뒤에 있다 (서버 로그에 남지 않음).
   const key = new URLSearchParams(location.hash.slice(1)).get('k') || '';
   const instanceId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random().toString(16).slice(2);
   const $ = (id) => document.getElementById(id);
-  const log = (m) => { $('log').textContent = `[${new Date().toLocaleTimeString()}] ${m}\n` + $('log').textContent.slice(0, 6000); };
+  // 화면에는 상태 한 줄만 보여 주고, 진단 내용은 개발자 콘솔에만 남긴다.
+  const log = (m) => console.log(`[SOOP 연결] ${m}`);
   const setState = (m) => { $('state').textContent = m; };
 
   let chat = null, state = 'idle', lastError = '', claimed = false, stopped = false, connecting = false, soopId = null;
@@ -31,7 +30,7 @@
   function stop(message) {
     stopped = true; state = 'idle';
     try { chat?.disconnect(); } catch {}
-    setState(`종료: ${message}`); log(`종료: ${message}`);
+    setState('SOOP 연결 종료'); log(`종료: ${message}`);
   }
 
   function setupChat(clientId) {
@@ -46,7 +45,7 @@
         const nickname = String(message?.userNickname || '').trim();
         if (!userId) return;
         post('/api/link/profile', { key, instanceId, userId, nickname }).then(({ status, data }) => {
-          if (status === 200) { soopId = data.soopId; log(`방송 확인: ${data.nickname || ''} (${data.soopId})`); setState(`연결됨: ${data.nickname || data.soopId}`); }
+          if (status === 200) { soopId = data.soopId; log(`방송 확인: ${data.nickname || ''} (${data.soopId})`); setState('SOOP 연결됨'); }
           else { lastError = data.error || `HTTP ${status}`; log(`방송 등록 실패: ${lastError}`); if (status === 409) stop(lastError); }
         });
       }
@@ -64,7 +63,7 @@
 
   async function connect(clientId) {
     if (connecting) return;
-    connecting = true; state = 'connecting'; setState('SOOP 채팅 연결 중…');
+    connecting = true; state = 'connecting'; setState('SOOP 연결 중…');
     try {
       const { status, data } = await post('/api/link/session', { key, instanceId, claim: false, wantToken: true, state, lastError });
       if (status !== 200 || data.status !== 'ready' || !data.accessToken) { state = 'idle'; return; }
@@ -80,13 +79,13 @@
   async function tick() {
     if (stopped) return;
     if (!key) return stop('세션 키가 없습니다.');
-    if (!window.SOOP || typeof window.SOOP.ChatSDK !== 'function') { lastError = 'SOOP Chat SDK를 불러오지 못했습니다.'; setState(lastError); }
+    if (!window.SOOP || typeof window.SOOP.ChatSDK !== 'function') { lastError = 'SOOP Chat SDK를 불러오지 못했습니다.'; log(lastError); }
     try {
       const { status, data } = await post('/api/link/session', { key, instanceId, claim: !claimed, state, lastError });
       claimed = true;
       if (status === 401 || data.status === 'invalid') return stop(data.message || '연결 정보가 없습니다.');
       if (data.status === 'stop') return stop(data.message || '연결 종료');
-      if (data.status === 'waiting') { setState(data.message || '대기 중'); if (state === 'connected') { try { chat?.disconnect(); } catch {} state = 'idle'; } }
+      if (data.status === 'waiting') { setState('SOOP 연결 대기 중…'); log(data.message || '대기 중'); if (state === 'connected') { try { chat?.disconnect(); } catch {} state = 'idle'; } }
       if (data.status === 'ready' && state !== 'connected' && window.SOOP?.ChatSDK) await connect(data.clientId);
     } catch (error) {
       lastError = `관리자 서버 연결 실패: ${error?.message || error}`; log(lastError);
