@@ -1,0 +1,32 @@
+# Stardew SOOP Bridge Central - HTTPS 공개 설정 (Caddy)
+# 실행: C:\Users\gusan\st\tools\caddy\caddy.exe run --config deploy\Caddyfile --adapter caddyfile
+# 도메인을 바꾸면 아래 주소, config/central.json의 publicBaseUrl, SOOP 앱 Redirect URL 세 곳을 함께 바꾼다.
+# Caddy가 HTTPS 인증서를 자동으로 발급하고 갱신한다 (인터넷에서 이 PC의 80, 443으로 들어올 수 있어야 함).
+
+{
+	# 인증서 계정용 이메일. 이 값이 있으면 Let's Encrypt가 거부할 때(kro.kr 공유 발급 한도 초과 등)
+	# ZeroSSL(무료, ACME)로 자동으로 넘어간다. 만료 알림도 이 주소로 온다.
+	email gusansdl@gmail.com
+}
+
+stardewoauth.kro.kr {
+	encode zstd gzip
+
+	# 인터넷에 여는 경로: 스트리머 브라우저(SOOP 로그인)와 숨은 Edge(연결 페이지)가 쓰는 것만
+	@public path /health /link/* /oauth/callback /api/link/*
+	handle @public {
+		reverse_proxy 127.0.0.1:3001
+	}
+
+	# 관리자 페이지(/admin)와 게임 서버용 API(/api/agent/*)는 이 PC에서만.
+	# 이 PC는 공인 IP가 직접 붙어 있어서 도메인으로 접속하면 출발지가 220.74.59.235로 보인다.
+	# 공인 IP가 바뀌면 이 줄도 바꾸거나, 이 PC에서 http://127.0.0.1:3001/admin 으로 접속한다.
+	@local remote_ip 127.0.0.1 ::1 220.74.59.235
+	handle @local {
+		reverse_proxy 127.0.0.1:3001
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+}
