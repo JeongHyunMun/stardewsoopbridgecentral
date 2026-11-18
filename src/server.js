@@ -9,6 +9,7 @@ import { randomToken, hashToken, safeEqual, hashPassword, verifyPassword, create
 import { RulesProvider, computeRewards, REWARD_TYPES } from './rewards.js';
 import { soopConfig, isSoopConfigured, authorizeUrl, exchangeCode, refreshTokens } from './soop.js';
 import { CentralConfig } from './central-config.js';
+import { ItemCatalog, normalizeItemId } from './item-catalog.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +28,8 @@ const secure = process.env.TRUST_PROXY === 'true';
 const store = await new Store(dataDir).init();
 const tokenBox = createSecretBox(sessionSecret);
 // 보상 규칙(config/rules.json). 파일을 수정하면 재시작 없이 다음 후원부터 반영된다.
+// 아이템 지급 목록(config/stardew_item_codes.md). 파일을 고치면 재시작 없이 반영된다.
+const itemCatalog = new ItemCatalog(process.env.ITEM_CATALOG_FILE || path.resolve(root, '../config/stardew_item_codes.md'));
 const rules = new RulesProvider(process.env.RULES_FILE || path.resolve(root, '../config/rules.json'));
 if (secure) app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -122,7 +125,7 @@ function publicServer(g) {
   const online = Object.entries(g.onlineFarmers || {}).filter(([, t]) => Date.now() - Date.parse(t) < ONLINE_WINDOW_MS).length;
   return { id: g.id, label: g.label, active: g.active !== false, createdAt: g.createdAt, lastSeenAt: g.lastSeenAt || null, onlinePlayers: online, streamers: store.data.streamers.filter(s => s.serverId === g.id && s.active).length };
 }
-function publicJob(j) { return { id: j.id, streamerId: j.streamerId, streamerLabel: streamerDisplayName(j.streamerId, j.soopId), soopId: j.soopId, farmerName: j.farmerName, rewardType: j.rewardType, amount: j.amount, reason: j.reason, source: j.source, status: j.status, createdAt: j.createdAt, updatedAt: j.updatedAt, completedAt: j.completedAt || null, attempts: j.attempts, lastError: j.lastError || null, createdBy: j.createdBy }; }
+function publicJob(j) { return { id: j.id, streamerId: j.streamerId, streamerLabel: streamerDisplayName(j.streamerId, j.soopId), soopId: j.soopId, farmerName: j.farmerName, rewardType: j.rewardType, amount: j.amount, itemId: j.itemId || null, itemName: j.itemName || null, quality: j.quality || 0, reason: j.reason, source: j.source, status: j.status, createdAt: j.createdAt, updatedAt: j.updatedAt, completedAt: j.completedAt || null, attempts: j.attempts, lastError: j.lastError || null, createdBy: j.createdBy }; }
 
 // 예전 구조(방송마다 토큰)를 게임 서버 구조로 옮긴다. 한 번만 실행되며, 실행 전에 db.json을 백업한다.
 async function migrateToGameServers() {
@@ -273,6 +276,38 @@ app.post('/api/admin/jobs', auth, adminOnly, async (req, res) => {
   const job = { id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName, rewardType, amount, reason, source: 'manual', status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: req.auth.user.username };
   store.data.jobs.unshift(job); await store.save(); await store.audit(req.auth.user.username, 'manual_reward_created', { jobId: job.id, streamerId: streamer.id, rewardType, amount, reason }); res.status(201).json({ ok: true, job: publicJob(job) });
 });
+// ── 아이템 지급 (관리자 페이지 '아이템 지급' 메뉴) ─────────────────────
+app.get('/api/admin/items', auth, adminOnly, (_req, res) => res.json({ ok: true, categories: itemCatalog.get().categories }));
+// 아이템 ID / 아이템명 / 목록 선택 중 정확히 하나로 지급한다. 게임 서버 모드가 다음 폴링 때 받아 플레이어 우편함(F5)에 넣는다.
+app.post('/api/admin/item-grants', auth, adminOnly, async (req, res) => {
+  const streamer = store.data.streamers.find(s => s.id === req.body?.streamerId && s.active && !s.deleted);
+  if (!streamer) return fail(res, 400, '활성화된 대상 스트리머를 선택하세요.');
+  const given = ['itemId', 'itemName', 'catalogId'].filter(k => String(req.body?.[k] ?? '').trim() !== '');
+  if (given.length !== 1) return fail(res, 400, '아이템 ID, 아이템명, 목록 선택 중 하나만 입력하세요.');
+  let itemId, itemName;
+  if (given[0] === 'itemId') {
+    itemId = normalizeItemId(req.body.itemId);
+    if (!itemId) return fail(res, 400, '아이템 ID 형식이 올바르지 않습니다. 예: (O)24, (T)IridiumAxe, 24');
+    itemName = itemCatalog.get().byId.get(itemId)?.name || null;
+  } else if (given[0] === 'itemName') {
+    const hits = itemCatalog.findByName(req.body.itemName);
+    if (!hits.length) return fail(res, 400, `"${String(req.body.itemName).trim()}" 이름의 아이템이 목록에 없습니다.`);
+    if (hits.length > 1) return fail(res, 400, `같은 이름의 아이템이 여러 개입니다: ${hits.map(h => `${h.name} ${h.id}`).join(', ')}. 아이템 ID나 목록 선택으로 지정하세요.`);
+    ({ id: itemId, name: itemName } = hits[0]);
+  } else {
+    const hit = itemCatalog.get().byId.get(String(req.body.catalogId).trim());
+    if (!hit) return fail(res, 400, '목록에서 선택한 아이템을 찾을 수 없습니다. 페이지를 새로고침하세요.');
+    ({ id: itemId, name: itemName } = hit);
+  }
+  const amount = Number(req.body?.amount); const quality = Number(req.body?.quality ?? 0); const reason = String(req.body?.reason || '').trim().slice(0, 240);
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 999) return fail(res, 400, '수량은 1~999 사이 정수여야 합니다.');
+  if (![0, 1, 2, 4].includes(quality)) return fail(res, 400, '품질이 올바르지 않습니다.');
+  if (!reason) return fail(res, 400, '지급 사유를 입력하세요.');
+  const job = { id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType: 'item', itemId, itemName, quality, amount, reason, source: 'manual', status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: req.auth.user.username };
+  store.data.jobs.unshift(job); await store.save();
+  await store.audit(req.auth.user.username, 'item_grant_created', { jobId: job.id, streamerId: streamer.id, itemId, itemName, amount, quality, reason });
+  res.status(201).json({ ok: true, job: publicJob(job), warning: streamer.farmerId ? null : '이 스트리머는 아직 게임 캐릭터(FarmerId)가 없어, 게임에서 /숲로그인 한 뒤에 지급됩니다.' });
+});
 app.post('/api/admin/jobs/:id/retry', auth, adminOnly, async (req, res) => {
   const job = store.data.jobs.find(j => j.id === req.params.id); if (!job) return fail(res, 404, '작업을 찾을 수 없습니다.');
   if (!['RETRY','REVIEW','PENDING'].includes(job.status)) return fail(res, 409, '완료 또는 처리 중인 작업은 직접 재시도할 수 없습니다.');
@@ -288,7 +323,10 @@ app.post('/api/admin/jobs/:id/review', auth, adminOnly, async (req, res) => {
 
 // 후원 1건을 기록하고 config/rules.json 기준으로 보상 작업을 만든다 (규칙 파일을 고치면 재시작 없이 반영).
 // 반환: { status, body } — 같은 방송의 같은 eventId는 한 번만 처리한다.
-async function recordDonation({ eventId, soopId, balloons, actor }) {
+// 후원자 닉네임(donorNickname)은 해당 스트리머에게 보낼 알림 문구에만 쓰고, 후원 기록·작업·감사 로그에는 저장하지 않는다.
+const REWARD_LABELS = { chest: ['일반상자', '개', '획득하였습니다'], premiumChest: ['고급상자', '개', '획득하였습니다'], monster: ['몬스터', '마리', '소환하였습니다'] };
+const cleanNick = v => String(v ?? '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 20) || '익명';
+async function recordDonation({ eventId, soopId, balloons, actor, donorNickname }) {
   if (!eventId || eventId.length > 200 || !/^[A-Za-z0-9_.-]{2,100}$/.test(soopId) || !Number.isSafeInteger(balloons) || balloons <= 0 || balloons > 1000000) {
     return { status: 400, body: { ok: false, error: '후원 이벤트 데이터가 올바르지 않습니다.' } };
   }
@@ -299,6 +337,13 @@ async function recordDonation({ eventId, soopId, balloons, actor }) {
   const rewards = streamer ? computeRewards(rules.get(), balloons) : [];
   for (const { rewardType, amount } of rewards) {
     store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: 별풍선 ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: actor });
+  }
+  if (streamer && donorNickname !== undefined) {
+    const nick = cleanNick(donorNickname);
+    for (const { rewardType, amount } of rewards) {
+      const [label, unit, verb] = REWARD_LABELS[rewardType] || [rewardType, '개', '획득하였습니다'];
+      pushLinkEvent(streamer, 'info', `${nick}님이 별풍선 ${balloons}개를 후원하여 ${label} ${amount}${unit}를 ${verb}.`);
+    }
   }
   await store.save(); await store.audit(actor, 'donation_received', { eventId, soopId, balloons, status: donation.status, rewards });
   return { status: 201, body: { ok: true, donationId: donation.id, status: donation.status, rewards } };
@@ -343,6 +388,8 @@ app.post('/api/agent/poll', async (req, res) => {
   server.onlineFarmers = Object.fromEntries(Object.entries(server.onlineFarmers || {}).filter(([, t]) => now - Date.parse(t) < ONLINE_WINDOW_MS));
   const online = Array.isArray(req.body?.onlineFarmerIds) ? req.body.onlineFarmerIds.map(String).filter(x => /^-?\d+$/.test(x)).slice(0, 200) : [];
   for (const id of online) server.onlineFarmers[id] = server.lastSeenAt;
+  // 장기 미접속 정리용: 스트리머별 마지막 접속 시각 (쓰기를 줄이려고 1시간에 한 번만 갱신)
+  for (const s of serverStreamers(server)) if (s.farmerId && online.includes(String(s.farmerId)) && !(s.lastActiveAt && Date.now() - Date.parse(s.lastActiveAt) < 60 * 60 * 1000)) s.lastActiveAt = server.lastSeenAt;
 
   const mine = new Map(serverStreamers(server).map(s => [s.id, s]));
   for (const j of store.data.jobs) if (mine.has(j.streamerId) && j.status === 'LEASED' && j.leaseUntil && Date.parse(j.leaseUntil) < now) { j.status = 'RETRY'; j.lastError = '게임 연결 응답 시간 초과. 지급 여부 확인 필요'; j.updatedAt = nowIso(); }
@@ -356,7 +403,7 @@ app.post('/api/agent/poll', async (req, res) => {
   if (!job) { await store.save(); return res.json({ ok: true, job: null, linkEvents, publicBaseUrl: publicBase, serverTime: nowIso() }); }
   const streamer = mine.get(job.streamerId);
   job.status = 'LEASED'; job.attempts += 1; job.leaseUntil = new Date(now + 120000).toISOString(); job.updatedAt = nowIso(); await store.save();
-  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, linkEvents, publicBaseUrl: publicBase, serverTime: nowIso() });
+  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId, rewardType: job.rewardType, amount: job.amount, itemId: job.itemId || null, quality: job.quality || 0, reason: job.reason }, linkEvents, publicBaseUrl: publicBase, serverTime: nowIso() });
 });
 app.post('/api/agent/ack', async (req, res) => {
   const server = agentServer(req);
@@ -594,11 +641,24 @@ app.post('/api/link/donation', async (req, res) => {
   if (!s.soopId) return fail(res, 409, '아직 방송 정보(SOOP ID)를 받지 못했습니다.');
   const bjId = String(req.body?.bjId || '').trim();
   if (bjId && bjId.toLowerCase() !== s.soopId.toLowerCase()) return fail(res, 403, `다른 방송(${bjId})의 후원입니다.`);
-  const r = await recordDonation({ eventId: String(req.body?.eventId || '').trim(), soopId: s.soopId, balloons: Number(req.body?.balloons), actor: `link:${s.soopId}` });
+  const r = await recordDonation({ eventId: String(req.body?.eventId || '').trim(), soopId: s.soopId, balloons: Number(req.body?.balloons), actor: `link:${s.soopId}`, donorNickname: String(req.body?.donorNickname ?? '') });
   res.status(r.status).json(r.body);
 });
 
 app.get('/admin', (_req, res) => { res.set('Cache-Control', 'no-store'); res.sendFile(adminHtmlPath); });
 app.get('/api/admin/users', auth, ownerOnly, (_req, res) => res.json({ ok: true, users: store.data.users.map(publicUser) }));
 app.use((err, _req, res, _next) => { console.error('[server error]', err?.stack || err); fail(res, 500, '서버 내부 오류가 발생했습니다. 서버 로그를 확인하세요.'); });
+// ── 장기 미접속 연동 정보 삭제 ───────────────────────────────────────────
+// 마지막 접속 후 INACTIVE_UNLINK_DAYS(기본 180일)가 지난 스트리머는 /숲로그아웃과 같은 방식으로 토큰과 식별정보를 지운다 (개인정보처리방침 7조).
+const INACTIVE_UNLINK_DAYS = Math.max(30, Number(process.env.INACTIVE_UNLINK_DAYS) || 180);
+const lastActivityOf = s => Math.max(...[s.lastActiveAt, s.sdkSeenAt, s.linkedAt, s.pairedAt].map(t => (t ? Date.parse(t) : 0) || 0));
+async function unlinkInactiveStreamers() {
+  const limit = Date.now() - INACTIVE_UNLINK_DAYS * 24 * 60 * 60 * 1000;
+  const stale = store.data.streamers.filter(s => !s.deleted && lastActivityOf(s) > 0 && lastActivityOf(s) < limit);
+  for (const s of stale) await unlinkStreamer(s, 'system', `${INACTIVE_UNLINK_DAYS}일 이상 접속하지 않아 자동 해제됨`);
+  if (stale.length) console.log(`[정리] 장기 미접속 스트리머 ${stale.length}명의 연동 정보를 삭제했습니다.`);
+}
+unlinkInactiveStreamers().catch(e => console.error('[정리] 장기 미접속 삭제 실패:', e.message));
+setInterval(() => unlinkInactiveStreamers().catch(e => console.error('[정리] 장기 미접속 삭제 실패:', e.message)), 6 * 60 * 60 * 1000).unref();
+
 app.listen(port, host, () => console.log(`[StardewSOOPBridge Central] listening on http://${host}:${port}; 인증 도메인: ${publicBaseUrl()} (config/central.json); admin page: /admin; health: /health`));
