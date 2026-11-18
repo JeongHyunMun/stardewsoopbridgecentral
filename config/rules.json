@@ -2,6 +2,6 @@
   "rules": [
     { "name": "normal-chest", "type": "chest", "exactBalloons": 1, "amount": 1 },
     { "name": "premium-chest", "type": "premiumChest", "exactBalloons": 2, "amount": 1 },
-    { "name": "monster-33", "type": "monster", "minBalloons": 33, "amount": 1 }
+    { "name": "monster-3", "type": "monster", "exactBalloons": 3, "amount": 1 }
   ]
 }
