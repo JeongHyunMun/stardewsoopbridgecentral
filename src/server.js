@@ -88,6 +88,14 @@ const streamerDisplayName = (streamerId, fallback) => { const s = store.data.str
 const serverOf = s => store.data.gameServers.find(g => g.id === s.serverId) || null;
 const isFarmerOnline = (server, farmerId) => Boolean(server && farmerId && server.onlineFarmers?.[farmerId] && Date.now() - Date.parse(server.onlineFarmers[farmerId]) < ONLINE_WINDOW_MS);
 
+// 연동 결과를 게임에 알리기 위한 대기열. 게임 서버가 다음 폴링 때 가져가서 해당 플레이어 화면에 표시한다.
+function pushLinkEvent(s, kind, message) {
+  const server = serverOf(s);
+  if (!server || !s.farmerId) return;
+  server.linkEvents = (server.linkEvents || []).filter(e => Date.now() - Date.parse(e.at) < 10 * 60 * 1000).slice(-50);
+  server.linkEvents.push({ id: crypto.randomUUID(), farmerId: s.farmerId, kind, message: String(message).slice(0, 200), at: nowIso() });
+}
+
 function linkState(s) {
   if (s.sdkSeenAt && Date.now() - Date.parse(s.sdkSeenAt) < SDK_ALIVE_MS && s.sdkState === 'connected') return 'connected';
   if (s.soopAuth?.access) return 'loggedIn';
@@ -308,11 +316,14 @@ app.post('/api/agent/poll', async (req, res) => {
   const mine = new Map(serverStreamers(server).map(s => [s.id, s]));
   for (const j of store.data.jobs) if (mine.has(j.streamerId) && j.status === 'LEASED' && j.leaseUntil && Date.parse(j.leaseUntil) < now) { j.status = 'RETRY'; j.lastError = '게임 연결 응답 시간 초과. 지급 여부 확인 필요'; j.updatedAt = nowIso(); }
   // FarmerId가 정해진 스트리머의 작업만 내보낸다 (없으면 지급할 대상을 모름).
+  // 연동 결과 알림은 한 번만 내려보낸다.
+  const linkEvents = (server.linkEvents || []).map(({ farmerId, kind, message }) => ({ farmerId, kind, message }));
+  server.linkEvents = [];
   const job = store.data.jobs.slice().reverse().find(j => j.status === 'PENDING' && mine.get(j.streamerId)?.farmerId);
-  if (!job) { await store.save(); return res.json({ ok: true, job: null, serverTime: nowIso() }); }
+  if (!job) { await store.save(); return res.json({ ok: true, job: null, linkEvents, serverTime: nowIso() }); }
   const streamer = mine.get(job.streamerId);
   job.status = 'LEASED'; job.attempts += 1; job.leaseUntil = new Date(now + 120000).toISOString(); job.updatedAt = nowIso(); await store.save();
-  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, serverTime: nowIso() });
+  res.json({ ok: true, job: { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId, rewardType: job.rewardType, amount: job.amount, reason: job.reason }, linkEvents, serverTime: nowIso() });
 });
 app.post('/api/agent/ack', async (req, res) => {
   const server = agentServer(req);
@@ -421,16 +432,22 @@ app.get('/oauth/callback', async (req, res) => {
   const s = findByTicket(ticket);
   res.set('Set-Cookie', `${linkCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`);
   if (!s) return res.status(410).send(page('연결 실패', '<h1>연결 시간이 지났습니다</h1><p class="muted">게임 채팅창에서 <b>/숲로그인</b>을 다시 입력하세요.</p>'));
-  if (!code) return res.status(400).send(page('연결 실패', '<h1>SOOP 로그인이 취소되었습니다</h1><p class="muted">다시 하려면 게임 채팅창에서 <b>/숲로그인</b>을 입력하세요.</p>'));
+  if (!code) {
+    pushLinkEvent(s, 'error', 'SOOP 연동 실패: SOOP 로그인이 취소되었습니다. 다시 하려면 /숲로그인을 입력하세요.');
+    await store.save();
+    return res.status(400).send(page('연결 실패', '<h1>SOOP 로그인이 취소되었습니다</h1><p class="muted">다시 하려면 게임 채팅창에서 <b>/숲로그인</b>을 입력하세요.</p>'));
+  }
   try {
     const t = await exchangeCode(code);
     s.soopAuth = { access: tokenBox.seal(t.accessToken), refresh: tokenBox.seal(t.refreshToken), expiresAt: t.expiresAt };
     s.loginTicketHash = null; s.loginTicketExpiresAt = null; s.linkedAt = nowIso();
+    pushLinkEvent(s, 'info', 'SOOP 로그인 완료. 방송 채팅에 연결하는 중입니다...');
     await store.save(); await store.audit('soop', 'soop_login_completed', { streamerId: s.id, farmerId: s.farmerId });
     res.send(page('연결 완료', '<h1>SOOP 연결 완료</h1><p>이 창을 닫고 게임으로 돌아가세요.</p><p class="muted">잠시 후 게임 채팅창에 방송 연결 결과가 표시됩니다.</p>'));
   } catch (error) {
     console.error('[SOOP 로그인]', error.message);
-    await store.audit('soop', 'soop_login_failed', { streamerId: s.id, error: error.message });
+    pushLinkEvent(s, 'error', `SOOP 연동 실패: 로그인 처리 중 오류가 났습니다 (${error.message}). /숲로그인을 다시 해 주세요.`);
+    await store.save(); await store.audit('soop', 'soop_login_failed', { streamerId: s.id, error: error.message });
     res.status(502).send(page('연결 실패', `<h1>SOOP 연결에 실패했습니다</h1><p class="muted">${escapeHtml(error.message)}</p><p class="muted">게임 채팅창에서 <b>/숲로그인</b>을 다시 입력하세요.</p>`));
   }
 });
@@ -460,7 +477,9 @@ async function accessTokenFor(s) {
     return t.accessToken;
   } catch (error) {
     // 갱신이 안 되면(동의 철회 등) 토큰을 지우고 다시 로그인하게 한다 (이용약관 제11조 17항).
-    s.soopAuth = null; await store.save(); await store.audit('soop', 'soop_token_refresh_failed', { streamerId: s.id, error: error.message });
+    s.soopAuth = null;
+    pushLinkEvent(s, 'error', 'SOOP 로그인이 만료되었습니다. 후원을 계속 받으려면 /숲로그인을 다시 해 주세요.');
+    await store.save(); await store.audit('soop', 'soop_token_refresh_failed', { streamerId: s.id, error: error.message });
     return null;
   }
 }
@@ -478,6 +497,11 @@ app.post('/api/link/session', async (req, res) => {
   s.sdkSeenAt = nowIso();
   s.sdkState = ['connected', 'connecting', 'idle', 'error'].includes(req.body?.state) ? req.body.state : 'idle';
   s.sdkError = req.body?.lastError ? String(req.body.lastError).slice(0, 200) : null;
+  // 방송 연결 실패는 연결(숨은 Edge)마다 한 번만 알린다.
+  if (s.sdkState === 'error' && s.sdkError && s.errorAnnouncedInstance !== instanceId) {
+    s.errorAnnouncedInstance = instanceId;
+    pushLinkEvent(s, 'error', `SOOP 연동 실패: 방송 채팅에 연결하지 못했습니다 (${s.sdkError}). 계속 실패하면 관리자에게 알려 주세요.`);
+  }
 
   const answer = async (body) => { await store.save(); return res.json({ ok: true, ...body }); };
   if (!s.active) return answer({ status: 'stop', message: '관리자가 이 스트리머의 연결을 중지했습니다.' });
@@ -506,15 +530,25 @@ app.post('/api/link/profile', async (req, res) => {
   const nickname = String(req.body?.nickname || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60);
   if (!/^[A-Za-z0-9_.-]{2,100}$/.test(soopId)) return fail(res, 400, 'SOOP ID가 올바르지 않습니다.');
   const taken = store.data.streamers.find(x => x.id !== s.id && !x.deleted && x.soopId && x.soopId.toLowerCase() === soopId.toLowerCase());
-  if (taken) return fail(res, 409, `이 SOOP 계정(${soopId})은 이미 다른 게임 캐릭터에 연결되어 있습니다. 관리자에게 문의하세요.`);
+  if (taken) {
+    pushLinkEvent(s, 'error', `SOOP 연동 실패: 이 SOOP 계정(${soopId})은 이미 다른 게임 캐릭터에 연결되어 있습니다. 관리자에게 문의하세요.`);
+    await store.save();
+    return fail(res, 409, `이 SOOP 계정(${soopId})은 이미 다른 게임 캐릭터에 연결되어 있습니다. 관리자에게 문의하세요.`);
+  }
   const changed = s.soopId !== soopId || (nickname && s.nickname !== nickname);
   if (changed) {
     const previous = { soopId: s.soopId || null, nickname: s.nickname || null };
     s.soopId = soopId; if (nickname) { s.nickname = nickname; s.nicknameUpdatedAt = nowIso(); }
     s.verifiedAt = nowIso();
     for (const j of store.data.jobs) if (j.streamerId === s.id && j.status === 'PENDING') j.soopId = soopId;
-    await store.save(); await store.audit(`link:${soopId}`, 'streamer_profile_linked', { streamerId: s.id, farmerId: s.farmerId, from: previous, to: { soopId, nickname } });
+    await store.audit(`link:${soopId}`, 'streamer_profile_linked', { streamerId: s.id, farmerId: s.farmerId, from: previous, to: { soopId, nickname } });
   }
+  // 연동 성공은 연결(숨은 Edge)마다 한 번만 알린다. 다음 접속 때 자동 재연결돼도 다시 알린다.
+  if (s.successAnnouncedInstance !== req.body.instanceId) {
+    s.successAnnouncedInstance = req.body.instanceId;
+    pushLinkEvent(s, 'success', `SOOP 연동 성공! ${s.nickname || soopId}(${soopId}) 방송의 별풍선 후원을 받습니다.`);
+  }
+  await store.save();
   res.json({ ok: true, soopId, nickname: s.nickname });
 });
 
