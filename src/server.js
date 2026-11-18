@@ -54,8 +54,12 @@ function auth(req, res, next) {
 function adminOnly(req, res, next) { if (!req.auth || !['owner', 'operator'].includes(req.auth.user.role)) return fail(res, 403, '관리자 권한이 필요합니다.'); next(); }
 function ownerOnly(req, res, next) { if (!req.auth || req.auth.user.role !== 'owner') return fail(res, 403, '최고 관리자만 사용할 수 있습니다.'); next(); }
 function publicUser(u) { return { id: u.id, username: u.username, displayName: u.displayName, role: u.role, active: u.active, createdAt: u.createdAt }; }
-function publicStreamer(s) { return { id: s.id, label: s.label, soopId: s.soopId, farmerId: s.farmerId || null, active: s.active, pairedAt: s.pairedAt, lastSeenAt: s.lastSeenAt || null }; }
-function publicJob(j) { return { id: j.id, streamerId: j.streamerId, streamerLabel: j.streamerLabel, soopId: j.soopId, farmerName: j.farmerName, rewardType: j.rewardType, amount: j.amount, reason: j.reason, source: j.source, status: j.status, createdAt: j.createdAt, updatedAt: j.updatedAt, completedAt: j.completedAt || null, attempts: j.attempts, lastError: j.lastError || null, createdBy: j.createdBy }; }
+// 방송 이름은 관리자가 입력하지 않는다. 스트리머가 SOOP 로그인하면 브리지가 /api/agent/profile로 닉네임을 보내고,
+// 그 전까지는 SOOP ID를 표시한다.
+const displayName = s => s.nickname || s.soopId;
+const streamerDisplayName = (streamerId, fallback) => { const s = store.data.streamers.find(x => x.id === streamerId); return s ? displayName(s) : fallback; };
+function publicStreamer(s) { return { id: s.id, soopId: s.soopId, nickname: s.nickname || null, displayName: displayName(s), nicknameUpdatedAt: s.nicknameUpdatedAt || null, farmerId: s.farmerId || null, active: s.active, pairedAt: s.pairedAt, lastSeenAt: s.lastSeenAt || null }; }
+function publicJob(j) { return { id: j.id, streamerId: j.streamerId, streamerLabel: streamerDisplayName(j.streamerId, j.soopId), soopId: j.soopId, farmerName: j.farmerName, rewardType: j.rewardType, amount: j.amount, reason: j.reason, source: j.source, status: j.status, createdAt: j.createdAt, updatedAt: j.updatedAt, completedAt: j.completedAt || null, attempts: j.attempts, lastError: j.lastError || null, createdBy: j.createdBy }; }
 
 async function ensureOwner() {
   const username = process.env.ADMIN_USERNAME || '';
@@ -99,12 +103,12 @@ app.get('/api/admin/overview', auth, adminOnly, (req, res) => {
   res.json({ ok: true, counts: { streamers: store.data.streamers.filter(s => s.active).length, pending: jobs.filter(j => ['PENDING','RETRY'].includes(j.status)).length, leased: jobs.filter(j => j.status === 'LEASED').length, review: jobs.filter(j => j.status === 'REVIEW').length, completed: jobs.filter(j => j.status === 'COMPLETED').length, donations: store.data.donations.length }, jobs: jobs.slice(0, 100).map(publicJob), streamers: store.data.streamers.map(publicStreamer), audit: store.data.audit.slice(0, 50), users: req.auth.user.role === 'owner' ? store.data.users.map(publicUser) : [] });
 });
 app.post('/api/admin/streamers', auth, ownerOnly, async (req, res) => {
-  const label = String(req.body?.label || '').trim().slice(0, 80); const soopId = String(req.body?.soopId || '').trim().slice(0, 100);
+  const soopId = String(req.body?.soopId || '').trim().slice(0, 100);
   const farmerId = req.body?.farmerId !== undefined && req.body?.farmerId !== '' ? String(req.body.farmerId).trim() : null;
-  if (!label || !/^[A-Za-z0-9_.-]{2,100}$/.test(soopId)) return fail(res, 400, '표시 이름과 올바른 SOOP 방송 ID가 필요합니다.');
+  if (!/^[A-Za-z0-9_.-]{2,100}$/.test(soopId)) return fail(res, 400, '올바른 SOOP 방송 ID가 필요합니다.');
   if (farmerId !== null && !/^\d+$/.test(farmerId)) return fail(res, 400, 'FarmerId는 숫자여야 합니다.');
   if (store.data.streamers.some(s => s.soopId.toLowerCase() === soopId.toLowerCase())) return fail(res, 409, '이미 등록된 SOOP 방송 ID입니다.');
-  const token = randomToken(32); const streamer = { id: crypto.randomUUID(), label, soopId, farmerId: farmerId ? BigInt(farmerId).toString() : null, tokenHash: hashToken(token), active: true, pairedAt: new Date().toISOString(), createdBy: req.auth.user.username };
+  const token = randomToken(32); const streamer = { id: crypto.randomUUID(), soopId, nickname: null, farmerId: farmerId ? BigInt(farmerId).toString() : null, tokenHash: hashToken(token), active: true, pairedAt: new Date().toISOString(), createdBy: req.auth.user.username };
   store.data.streamers.push(streamer); await store.save(); await store.audit(req.auth.user.username, 'streamer_paired', { streamerId: streamer.id, soopId, farmerId });
   res.status(201).json({ ok: true, streamer: publicStreamer(streamer), agentToken: token, warning: '이 토큰은 지금 한 번만 표시됩니다. 스트리머 SMAPI 모드의 config.json에 안전하게 입력하세요.' });
 });
@@ -141,7 +145,7 @@ app.post('/api/admin/jobs', auth, adminOnly, async (req, res) => {
   if (!['chest','monster'].includes(rewardType)) return fail(res, 400, '보상 종류가 올바르지 않습니다.');
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1000) return fail(res, 400, '수량은 1~1000 사이 정수여야 합니다.');
   if (!reason) return fail(res, 400, '지급 사유를 입력하세요.');
-  const job = { id: crypto.randomUUID(), streamerId: streamer.id, streamerLabel: streamer.label, soopId: streamer.soopId, farmerName, rewardType, amount, reason, source: 'manual', status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: req.auth.user.username };
+  const job = { id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName, rewardType, amount, reason, source: 'manual', status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: req.auth.user.username };
   store.data.jobs.unshift(job); await store.save(); await store.audit(req.auth.user.username, 'manual_reward_created', { jobId: job.id, streamerId: streamer.id, rewardType, amount, reason }); res.status(201).json({ ok: true, job: publicJob(job) });
 });
 app.post('/api/admin/jobs/:id/retry', auth, adminOnly, async (req, res) => {
@@ -167,7 +171,7 @@ app.post('/api/ingest/donation', async (req, res) => {
   if (streamer) {
     // 지급 기준은 config/rules.json에서 읽는다 (수정하면 재시작 없이 반영).
     for (const { rewardType, amount } of computeRewards(rules.get(), balloons)) {
-      store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, streamerLabel: streamer.label, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: 'soop-ingest' });
+      store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: 'soop-ingest' });
     }
   }
   await store.save(); await store.audit('soop-ingest', 'donation_received', { eventId, soopId, balloons, status: donation.status }); res.status(201).json({ ok: true, donationId: donation.id, status: donation.status });
@@ -185,6 +189,22 @@ app.post('/api/agent/poll', async (req, res) => {
   job.status = 'LEASED'; job.attempts += 1; job.leaseUntil = new Date(now + 120000).toISOString(); job.updatedAt = new Date().toISOString(); await store.save();
   const jobObj = { id: job.id, soopId: job.soopId, farmerName: job.farmerName, farmerId: streamer.farmerId || null, rewardType: job.rewardType, amount: job.amount, reason: job.reason };
   res.json({ ok: true, job: jobObj, serverTime: new Date().toISOString() });
+});
+// 스트리머 PC의 로컬 브리지가 SOOP 채팅 접속(JOIN) 때 받은 본인 닉네임을 보낸다.
+// 토큰으로 방송을 찾고, 보낸 SOOP ID가 그 방송과 같을 때만 저장한다.
+app.post('/api/agent/profile', async (req, res) => {
+  const token = String(req.get('X-Agent-Token') || ''); const streamer = store.data.streamers.find(s => s.active && safeEqual(s.tokenHash, hashToken(token)));
+  if (!streamer) return fail(res, 401, '게임 연결 토큰이 올바르지 않거나 비활성화되었습니다.');
+  const soopId = String(req.body?.soopId || '').trim();
+  const nickname = String(req.body?.nickname || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (soopId.toLowerCase() !== streamer.soopId.toLowerCase()) return fail(res, 403, `로그인한 SOOP 계정(${soopId || '없음'})이 이 토큰에 등록된 방송(${streamer.soopId})과 다릅니다.`);
+  if (!nickname || nickname.length > 60) return fail(res, 400, '닉네임이 비어 있거나 너무 깁니다.');
+  if (streamer.nickname !== nickname) {
+    const previous = streamer.nickname || null;
+    streamer.nickname = nickname; streamer.nicknameUpdatedAt = new Date().toISOString();
+    await store.save(); await store.audit(`agent:${streamer.soopId}`, 'streamer_nickname_updated', { streamerId: streamer.id, from: previous, to: nickname });
+  }
+  res.json({ ok: true, soopId: streamer.soopId, nickname });
 });
 app.post('/api/agent/ack', async (req, res) => {
   const token = String(req.get('X-Agent-Token') || ''); const streamer = store.data.streamers.find(s => s.active && safeEqual(s.tokenHash, hashToken(token)));
