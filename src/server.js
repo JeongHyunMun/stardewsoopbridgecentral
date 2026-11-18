@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { Store } from './store.js';
 import { randomToken, hashToken, safeEqual, hashPassword, verifyPassword } from './security.js';
-import { RulesProvider, computeRewards } from './rewards.js';
+import { RulesProvider, computeRewards, REWARD_TYPES } from './rewards.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -150,7 +150,7 @@ app.post('/api/admin/jobs', auth, adminOnly, async (req, res) => {
   const streamer = store.data.streamers.find(s => s.id === req.body?.streamerId && s.active);
   const rewardType = req.body?.rewardType; const amount = Number(req.body?.amount); const farmerName = String(req.body?.farmerName || '').trim().slice(0, 80); const reason = String(req.body?.reason || '').trim().slice(0, 240);
   if (!streamer) return fail(res, 400, '활성화된 대상 방송을 선택하세요.');
-  if (!['chest','monster'].includes(rewardType)) return fail(res, 400, '보상 종류가 올바르지 않습니다.');
+  if (!REWARD_TYPES.includes(rewardType)) return fail(res, 400, '보상 종류가 올바르지 않습니다.');
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1000) return fail(res, 400, '수량은 1~1000 사이 정수여야 합니다.');
   if (!reason) return fail(res, 400, '지급 사유를 입력하세요.');
   const job = { id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName, rewardType, amount, reason, source: 'manual', status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: req.auth.user.username };
@@ -168,21 +168,39 @@ app.post('/api/admin/jobs/:id/review', auth, adminOnly, async (req, res) => {
 });
 
 // Trusted ingestion endpoint for the SOOP SDK adapter. Store event before scheduling reward jobs.
-app.post('/api/ingest/donation', async (req, res) => {
-  if (!ingestToken || !safeEqual(req.get('X-Donation-Token'), ingestToken)) return fail(res, 401, '후원 수신 인증 실패');
-  const eventId = String(req.body?.eventId || '').trim(); const soopId = String(req.body?.soopId || '').trim(); const balloons = Number(req.body?.balloons);
-  if (!eventId || eventId.length > 200 || !/^[A-Za-z0-9_.-]{2,100}$/.test(soopId) || !Number.isSafeInteger(balloons) || balloons <= 0 || balloons > 1000000) return fail(res, 400, '후원 이벤트 데이터가 올바르지 않습니다.');
-  if (store.data.donations.some(d => d.eventId === eventId && d.soopId.toLowerCase() === soopId.toLowerCase())) return res.json({ ok: true, duplicate: true });
+// 후원 1건을 기록하고 config/rules.json 기준으로 보상 작업을 만든다 (규칙 파일을 고치면 재시작 없이 반영).
+// 반환: { status, body } — 같은 방송의 같은 eventId는 한 번만 처리한다.
+async function recordDonation({ eventId, soopId, balloons, actor }) {
+  if (!eventId || eventId.length > 200 || !/^[A-Za-z0-9_.-]{2,100}$/.test(soopId) || !Number.isSafeInteger(balloons) || balloons <= 0 || balloons > 1000000) {
+    return { status: 400, body: { ok: false, error: '후원 이벤트 데이터가 올바르지 않습니다.' } };
+  }
+  if (store.data.donations.some(d => d.eventId === eventId && d.soopId.toLowerCase() === soopId.toLowerCase())) return { status: 200, body: { ok: true, duplicate: true } };
   const streamer = store.data.streamers.find(s => s.active && s.soopId.toLowerCase() === soopId.toLowerCase());
   const donation = { id: crypto.randomUUID(), eventId, soopId, balloons, receivedAt: new Date().toISOString(), status: streamer ? 'RECORDED' : 'UNLINKED' };
   store.data.donations.unshift(donation);
-  if (streamer) {
-    // 지급 기준은 config/rules.json에서 읽는다 (수정하면 재시작 없이 반영).
-    for (const { rewardType, amount } of computeRewards(rules.get(), balloons)) {
-      store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: 'soop-ingest' });
-    }
+  const rewards = streamer ? computeRewards(rules.get(), balloons) : [];
+  for (const { rewardType, amount } of rewards) {
+    store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: 별풍선 ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), attempts: 0, createdBy: actor });
   }
-  await store.save(); await store.audit('soop-ingest', 'donation_received', { eventId, soopId, balloons, status: donation.status }); res.status(201).json({ ok: true, donationId: donation.id, status: donation.status });
+  await store.save(); await store.audit(actor, 'donation_received', { eventId, soopId, balloons, status: donation.status, rewards });
+  return { status: 201, body: { ok: true, donationId: donation.id, status: donation.status, rewards } };
+}
+
+// 서버 간 연동용 (공용 DONATION_INGEST_TOKEN).
+app.post('/api/ingest/donation', async (req, res) => {
+  if (!ingestToken || !safeEqual(req.get('X-Donation-Token'), ingestToken)) return fail(res, 401, '후원 수신 인증 실패');
+  const r = await recordDonation({ eventId: String(req.body?.eventId || '').trim(), soopId: String(req.body?.soopId || '').trim(), balloons: Number(req.body?.balloons), actor: 'soop-ingest' });
+  res.status(r.status).json(r.body);
+});
+
+// 스트리머 PC의 로컬 브리지용. 방송별 AgentToken으로 인증하고, 그 방송의 후원만 받는다.
+app.post('/api/agent/donation', async (req, res) => {
+  const token = String(req.get('X-Agent-Token') || ''); const streamer = store.data.streamers.find(s => s.active && safeEqual(s.tokenHash, hashToken(token)));
+  if (!streamer) return fail(res, 401, '게임 연결 토큰이 올바르지 않거나 비활성화되었습니다.');
+  const soopId = String(req.body?.soopId || '').trim();
+  if (soopId.toLowerCase() !== streamer.soopId.toLowerCase()) return fail(res, 403, `후원이 들어온 방송(${soopId || '없음'})이 이 토큰에 등록된 방송(${streamer.soopId})과 다릅니다.`);
+  const r = await recordDonation({ eventId: String(req.body?.eventId || '').trim(), soopId: streamer.soopId, balloons: Number(req.body?.balloons), actor: `bridge:${streamer.soopId}` });
+  res.status(r.status).json(r.body);
 });
 
 // SMAPI connector polls from the game PC outbound; no inbound game-port forwarding is required.

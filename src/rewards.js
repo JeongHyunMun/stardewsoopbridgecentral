@@ -3,7 +3,7 @@ import fs from 'node:fs';
 // 보상 규칙 로더. config/rules.json을 읽고, 파일이 바뀌면 재시작 없이 다시 읽는다.
 //
 // 규칙 하나의 형식:
-//   type          "chest" | "monster"                  (필수)
+//   type          "chest"(일반 상자) | "premiumChest"(고급 상자) | "monster"   (필수)
 //   minBalloons   이 개수 이상일 때 적용 (기본 1)
 //   maxBalloons   이 개수 이하일 때 적용 (기본 제한 없음)
 //   exactBalloons 정확히 이 개수일 때만 적용 (min/max와 함께 쓸 수 없음)
@@ -11,7 +11,8 @@ import fs from 'node:fs';
 //   perBalloons   N개당 1단위로 지급: floor(별풍선 / N) (amount와 함께 쓸 수 없음)
 // 조건에 맞는 모든 규칙의 수량은 type별로 합산된다.
 
-const TYPES = new Set(['chest', 'monster']);
+export const REWARD_TYPES = ['chest', 'premiumChest', 'monster'];
+const TYPES = new Set(REWARD_TYPES);
 const OPTIONAL_INT_KEYS = ['minBalloons', 'maxBalloons', 'exactBalloons', 'perBalloons', 'amount'];
 export const MAX_AMOUNT = 1000;
 
@@ -24,7 +25,7 @@ export function validateRules(doc) {
   return doc.rules.map((raw, i) => {
     const at = `rules[${i}]`;
     if (!raw || typeof raw !== 'object') throw new Error(`${at}: 객체여야 합니다.`);
-    if (!TYPES.has(raw.type)) throw new Error(`${at}: type은 chest 또는 monster여야 합니다.`);
+    if (!TYPES.has(raw.type)) throw new Error(`${at}: type은 chest, premiumChest, monster 중 하나여야 합니다.`);
     const rule = { name: String(raw.name ?? `rule-${i}`), type: raw.type };
     for (const key of OPTIONAL_INT_KEYS) {
       const value = raw[key] ?? undefined;
@@ -46,7 +47,7 @@ export function validateRules(doc) {
 
 /** 별풍선 개수에 해당하는 보상 목록을 돌려준다. 예: [{ rewardType: 'chest', amount: 2 }] */
 export function computeRewards(rules, balloons) {
-  const totals = { chest: 0, monster: 0 };
+  const totals = Object.fromEntries(REWARD_TYPES.map(t => [t, 0]));
   for (const rule of rules) {
     const matches = rule.exactBalloons !== undefined
       ? balloons === rule.exactBalloons
