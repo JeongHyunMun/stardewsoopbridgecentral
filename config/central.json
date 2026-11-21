@@ -1,3 +1,6 @@
+// Central 운영 설정. 저장하면 재시작 없이 바로 반영됩니다.
 {
+  // 인증 도메인: 스트리머 브라우저와 숨은 Edge가 접속하는 이 서버의 주소.
+  // 바꾸면 SOOP 개발자센터의 Redirect URL(이 주소 + /oauth/callback)과 deploy\Caddyfile 맨 위 주소도 같이 바꿔야 합니다.
   "publicBaseUrl": "https://stardewoauth.kro.kr"
 }

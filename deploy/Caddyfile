@@ -12,6 +12,17 @@
 stardewoauth.kro.kr {
 	encode zstd gzip
 
+	# 공개 위키와 개인정보처리방침 (정적 파일). 원본은 wiki\build-wiki.mjs, 다시 만들면 바로 반영된다.
+	redir / /wiki/
+	redir /wiki /wiki/
+	redir /privacy /privacy/
+	@site path /wiki/* /privacy/*
+	handle @site {
+		root * C:/Users/gusan/st/wiki/site
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+
 	# 인터넷에 여는 경로: 스트리머 브라우저(SOOP 로그인)와 숨은 Edge(연결 페이지)가 쓰는 것만
 	@public path /health /link/* /oauth/callback /api/link/*
 	handle @public {
@@ -19,9 +30,9 @@ stardewoauth.kro.kr {
 	}
 
 	# 관리자 페이지(/admin)와 게임 서버용 API(/api/agent/*)는 이 PC에서만.
-	# 이 PC는 공인 IP가 직접 붙어 있어서 도메인으로 접속하면 출발지가 220.74.59.235로 보인다.
+	# 이 PC는 공인 IP가 직접 붙어 있어서 도메인으로 접속하면 출발지가 220.74.59.57로 보인다.
 	# 공인 IP가 바뀌면 이 줄도 바꾸거나, 이 PC에서 http://127.0.0.1:3001/admin 으로 접속한다.
-	@local remote_ip 127.0.0.1 ::1 220.74.59.235
+	@local remote_ip 127.0.0.1 ::1 220.74.59.57
 	handle @local {
 		reverse_proxy 127.0.0.1:3001
 	}

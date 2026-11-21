@@ -49,12 +49,16 @@
           else { lastError = data.error || `HTTP ${status}`; log(`방송 등록 실패: ${lastError}`); if (status === 409) stop(lastError); }
         });
       }
-      if (action === 'BALLOON_GIFTED') {
+      // 일반 별풍선과 대결미션 별풍선(후원하는 순간)을 같은 규칙으로 보상한다.
+      const DONATION_KINDS = { BALLOON_GIFTED: 'balloon', BATTLE_MISSION_GIFTED: 'battleMission' };
+      if (DONATION_KINDS[action]) {
+        const kind = DONATION_KINDS[action];
+        const label = kind === 'battleMission' ? '대결미션 별풍선' : '별풍선';
         const balloons = Number(message?.count);
-        if (!Number.isSafeInteger(balloons) || balloons <= 0) { log(`별풍선 이벤트 형식 오류: count=${message?.count}`); return; }
+        if (!Number.isSafeInteger(balloons) || balloons <= 0) { log(`${label} 이벤트 형식 오류: count=${message?.count}`); return; }
         const eventId = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        post('/api/link/donation', { key, instanceId, eventId, balloons, bjId: String(message?.bjId || '') }).then(({ status, data }) => {
-          if (status === 200 || status === 201) log(`별풍선 ${balloons}개 전달 (${(data.rewards || []).map(r => `${r.rewardType} ${r.amount}`).join(', ') || '보상 없음'})`);
+        post('/api/link/donation', { key, instanceId, eventId, balloons, kind, bjId: String(message?.bjId || ''), donorNickname: String(message?.userNickname || '').trim().slice(0, 40) }).then(({ status, data }) => {
+          if (status === 200 || status === 201) log(`${label} ${balloons}개 전달 (${(data.rewards || []).map(r => `${r.rewardType} ${r.amount}`).join(', ') || '보상 없음'})`);
           else { lastError = data.error || `HTTP ${status}`; log(`후원 전달 실패: ${lastError}`); }
         });
       }

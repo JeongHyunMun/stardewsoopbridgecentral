@@ -1,7 +1,27 @@
+// 후원 보상 규칙: 별풍선(대결미션 포함) 개수에 따라 무엇을 줄지 정합니다.
+// 저장하면 다음 후원부터 바로 반영됩니다. 형식이 틀리면 이전 규칙을 계속 쓰고 콘솔 1에 오류가 뜹니다.
+//
+// 규칙 하나 = { "name": 이름(메모용), "type": 종류, 조건 하나, 수량 }
+//   type          chest(일반 상자) / premiumChest(고급 상자) / monster(몬스터) / tax(세금 징수) / priceShift(시세 변동) / food(뼈고기)
+//   조건 (하나만):
+//     exactBalloons   정확히 이 개수일 때            예: "exactBalloons": 50
+//     minBalloons     이 개수 이상일 때 (maxBalloons와 같이 쓰면 범위)   예: "minBalloons": 100, "maxBalloons": 199
+//   수량 (하나만):
+//     amount          고정 수량 (기본 1)
+//     perBalloons     N개마다 1개씩 = 별풍선 / N (나머지 버림)   예: "perBalloons": 10 → 35개면 3개
+// 여러 규칙이 동시에 맞으면 같은 종류끼리 수량을 더합니다. 한 번에 최대 1000개.
+// 세금, 시세 변동, 뼈고기의 세부 수치는 게임 서버 모드 config.json(Tax, PriceShift, Food)에 있습니다.
 {
   "rules": [
-    { "name": "normal-chest", "type": "chest", "exactBalloons": 1, "amount": 1 },
-    { "name": "premium-chest", "type": "premiumChest", "exactBalloons": 2, "amount": 1 },
-    { "name": "monster-3", "type": "monster", "exactBalloons": 3, "amount": 1 }
+    {"name":"normal-chest","type":"chest","exactBalloons":15,"amount":1},
+    {"name":"premium-chest","type":"premiumChest","exactBalloons":2,"amount":1},
+    {"name":"monster-3","type":"monster","exactBalloons":3,"amount":1},
+    {"name":"price-shift-4","type":"priceShift","exactBalloons":9,"amount":1},
+    {"name":"tax-5","type":"tax","exactBalloons":10,"amount":1},
+    {"name":"food-6","type":"food","exactBalloons":7,"amount":1},
+    {"name":"normal-chest-10","type":"chest","exactBalloons":4,"amount":11},
+    {"name":"premium-chest-10","type":"premiumChest","exactBalloons":5,"amount":11},
+    {"name":"monster-10","type":"monster","exactBalloons":6,"amount":10},
+    {"name":"food-10","type":"food","exactBalloons":1,"amount":10}
   ]
 }

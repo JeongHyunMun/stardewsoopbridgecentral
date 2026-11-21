@@ -1,9 +1,10 @@
 import fs from 'node:fs';
+import { parseJsonc } from './jsonc.js';
 
 // 보상 규칙 로더. config/rules.json을 읽고, 파일이 바뀌면 재시작 없이 다시 읽는다.
 //
 // 규칙 하나의 형식:
-//   type          "chest"(일반 상자) | "premiumChest"(고급 상자) | "monster"   (필수)
+//   type          "chest"(일반 상자) | "premiumChest"(고급 상자) | "monster" | "tax"(세금 징수) | "priceShift"(시세 변동) | "food"(뼈고기)   (필수)
 //   minBalloons   이 개수 이상일 때 적용 (기본 1)
 //   maxBalloons   이 개수 이하일 때 적용 (기본 제한 없음)
 //   exactBalloons 정확히 이 개수일 때만 적용 (min/max와 함께 쓸 수 없음)
@@ -11,7 +12,7 @@ import fs from 'node:fs';
 //   perBalloons   N개당 1단위로 지급: floor(별풍선 / N) (amount와 함께 쓸 수 없음)
 // 조건에 맞는 모든 규칙의 수량은 type별로 합산된다.
 
-export const REWARD_TYPES = ['chest', 'premiumChest', 'monster'];
+export const REWARD_TYPES = ['chest', 'premiumChest', 'monster', 'tax', 'priceShift', 'food'];
 const TYPES = new Set(REWARD_TYPES);
 const OPTIONAL_INT_KEYS = ['minBalloons', 'maxBalloons', 'exactBalloons', 'perBalloons', 'amount'];
 export const MAX_AMOUNT = 1000;
@@ -25,7 +26,7 @@ export function validateRules(doc) {
   return doc.rules.map((raw, i) => {
     const at = `rules[${i}]`;
     if (!raw || typeof raw !== 'object') throw new Error(`${at}: 객체여야 합니다.`);
-    if (!TYPES.has(raw.type)) throw new Error(`${at}: type은 chest, premiumChest, monster 중 하나여야 합니다.`);
+    if (!TYPES.has(raw.type)) throw new Error(`${at}: type은 chest, premiumChest, monster, tax, priceShift, food 중 하나여야 합니다.`);
     const rule = { name: String(raw.name ?? `rule-${i}`), type: raw.type };
     for (const key of OPTIONAL_INT_KEYS) {
       const value = raw[key] ?? undefined;
@@ -87,7 +88,7 @@ export class RulesProvider {
     this.#mtimeMs = fs.statSync(this.#file).mtimeMs; // 깨진 파일을 호출마다 다시 읽지 않도록 먼저 기록
     try {
       const text = fs.readFileSync(this.#file, 'utf8').replace(/^\uFEFF/, '');
-      this.#rules = validateRules(JSON.parse(text));
+      this.#rules = validateRules(parseJsonc(text));
       this.#logger.log(`[rules] 보상 규칙 로드: ${this.#rules.length}개 (${this.#file})`);
     } catch (error) {
       if (strict || !this.#rules) throw new Error(`보상 규칙 파일을 읽을 수 없습니다: ${error.message}`);

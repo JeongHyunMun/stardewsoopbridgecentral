@@ -33,7 +33,11 @@ async function tokenRequest(params) {
   try { data = JSON.parse(text); } catch { /* 아래에서 처리 */ }
   if (!response.ok || !data.access_token) {
     const detail = data.error_description || data.error || data.msg || text.slice(0, 200) || `HTTP ${response.status}`;
-    throw new Error(`SOOP 토큰 발급 실패: ${detail}`);
+    const error = new Error(`SOOP 토큰 발급 실패: ${detail}`);
+    // rejected = SOOP이 요청을 거절함 (동의 철회, 토큰 폐기 등). 네트워크 오류나 SOOP 서버 오류(5xx)는 rejected가 아니다.
+    error.status = response.status;
+    error.rejected = (response.status >= 400 && response.status < 500) || (response.ok && Boolean(data.error || (Number(data.result) < 0)));
+    throw error;
   }
   const expiresIn = Number(data.expires_in) > 0 ? Number(data.expires_in) : 28800;
   return {

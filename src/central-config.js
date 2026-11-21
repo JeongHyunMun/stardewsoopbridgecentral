@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { parseJsonc } from './jsonc.js';
 
 // Central 운영 설정 (config/central.json). 파일을 고치면 재시작 없이 다음 요청부터 반영된다.
 //
@@ -34,7 +35,7 @@ export class CentralConfig {
       const mtime = fs.statSync(this.#file).mtimeMs;
       if (mtime !== this.#mtimeMs) {
         this.#mtimeMs = mtime;
-        const raw = JSON.parse(fs.readFileSync(this.#file, 'utf8').replace(/^\uFEFF/, ''));
+        const raw = parseJsonc(fs.readFileSync(this.#file, 'utf8'));
         const next = { publicBaseUrl: normalizeBaseUrl(raw.publicBaseUrl) };
         if (next.publicBaseUrl !== this.#value.publicBaseUrl) this.#logger.log(`[config] 인증 도메인 변경: ${next.publicBaseUrl}`);
         this.#value = next;

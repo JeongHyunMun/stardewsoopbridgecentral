@@ -9,6 +9,7 @@ import { randomToken, hashToken, safeEqual, hashPassword, verifyPassword, create
 import { RulesProvider, computeRewards, REWARD_TYPES } from './rewards.js';
 import { soopConfig, isSoopConfigured, authorizeUrl, exchangeCode, refreshTokens } from './soop.js';
 import { CentralConfig } from './central-config.js';
+import { parseJsonc } from './jsonc.js';
 import { ItemCatalog, normalizeItemId } from './item-catalog.js';
 
 const app = express();
@@ -160,7 +161,7 @@ async function syncOwnerFromConfig() {
   adminConfigMtime = mtime;
   let username, password;
   try {
-    const raw = JSON.parse(fs.readFileSync(adminConfigFile, 'utf8').replace(/^\uFEFF/, ''));
+    const raw = parseJsonc(fs.readFileSync(adminConfigFile, 'utf8'));
     username = String(raw.username ?? '').trim(); password = String(raw.password ?? '');
     if (!username || !password) throw new Error('username과 password를 모두 적어야 합니다.');
   } catch (error) { console.error(`[보안] admin.json 오류, 이전 계정 유지: ${error.message}`); return; }
@@ -242,7 +243,7 @@ app.patch('/api/admin/streamers/:id', auth, ownerOnly, async (req, res) => {
   }
   if (req.body?.farmerId !== undefined) {
     const farmerId = String(req.body.farmerId).trim();
-    if (farmerId !== '' && !/^\d+$/.test(farmerId)) return fail(res, 400, 'FarmerId는 숫자여야 합니다.');
+    if (farmerId !== '' && !/^-?\d+$/.test(farmerId)) return fail(res, 400, 'FarmerId는 숫자여야 합니다.');
     s.farmerId = farmerId ? BigInt(farmerId).toString() : null;
     await store.audit(req.auth.user.username, 'streamer_farmerid_updated', { streamerId: s.id, farmerId: s.farmerId });
   }
@@ -268,11 +269,10 @@ app.patch('/api/admin/operators/:id', auth, ownerOnly, async (req, res) => {
 });
 app.post('/api/admin/jobs', auth, adminOnly, async (req, res) => {
   const streamer = store.data.streamers.find(s => s.id === req.body?.streamerId && s.active && !s.deleted);
-  const rewardType = req.body?.rewardType; const amount = Number(req.body?.amount); const farmerName = String(req.body?.farmerName || '').trim().slice(0, 80); const reason = String(req.body?.reason || '').trim().slice(0, 240);
+  const rewardType = req.body?.rewardType; const amount = Number(req.body?.amount); const farmerName = ''; const reason = String(req.body?.reason || '').trim().slice(0, 240) || '관리자 지급';
   if (!streamer) return fail(res, 400, '활성화된 대상 방송을 선택하세요.');
   if (!REWARD_TYPES.includes(rewardType)) return fail(res, 400, '보상 종류가 올바르지 않습니다.');
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1000) return fail(res, 400, '수량은 1~1000 사이 정수여야 합니다.');
-  if (!reason) return fail(res, 400, '지급 사유를 입력하세요.');
   const job = { id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName, rewardType, amount, reason, source: 'manual', status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: req.auth.user.username };
   store.data.jobs.unshift(job); await store.save(); await store.audit(req.auth.user.username, 'manual_reward_created', { jobId: job.id, streamerId: streamer.id, rewardType, amount, reason }); res.status(201).json({ ok: true, job: publicJob(job) });
 });
@@ -299,10 +299,9 @@ app.post('/api/admin/item-grants', auth, adminOnly, async (req, res) => {
     if (!hit) return fail(res, 400, '목록에서 선택한 아이템을 찾을 수 없습니다. 페이지를 새로고침하세요.');
     ({ id: itemId, name: itemName } = hit);
   }
-  const amount = Number(req.body?.amount); const quality = Number(req.body?.quality ?? 0); const reason = String(req.body?.reason || '').trim().slice(0, 240);
+  const amount = Number(req.body?.amount); const quality = Number(req.body?.quality ?? 0); const reason = String(req.body?.reason || '').trim().slice(0, 240) || '관리자 지급';
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > 999) return fail(res, 400, '수량은 1~999 사이 정수여야 합니다.');
   if (![0, 1, 2, 4].includes(quality)) return fail(res, 400, '품질이 올바르지 않습니다.');
-  if (!reason) return fail(res, 400, '지급 사유를 입력하세요.');
   const job = { id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType: 'item', itemId, itemName, quality, amount, reason, source: 'manual', status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: req.auth.user.username };
   store.data.jobs.unshift(job); await store.save();
   await store.audit(req.auth.user.username, 'item_grant_created', { jobId: job.id, streamerId: streamer.id, itemId, itemName, amount, quality, reason });
@@ -324,28 +323,39 @@ app.post('/api/admin/jobs/:id/review', auth, adminOnly, async (req, res) => {
 // 후원 1건을 기록하고 config/rules.json 기준으로 보상 작업을 만든다 (규칙 파일을 고치면 재시작 없이 반영).
 // 반환: { status, body } — 같은 방송의 같은 eventId는 한 번만 처리한다.
 // 후원자 닉네임(donorNickname)은 해당 스트리머에게 보낼 알림 문구에만 쓰고, 후원 기록·작업·감사 로그에는 저장하지 않는다.
-const REWARD_LABELS = { chest: ['일반상자', '개', '획득하였습니다'], premiumChest: ['고급상자', '개', '획득하였습니다'], monster: ['몬스터', '마리', '소환하였습니다'] };
+const REWARD_TEXT = {
+  chest: n => `일반상자 ${n}개를 획득하였습니다`,
+  premiumChest: n => `고급상자 ${n}개를 획득하였습니다`,
+  monster: n => `몬스터 ${n}마리를 소환하였습니다`,
+  food: n => `뼈고기 ${n}개를 획득하였습니다`,
+  tax: () => '세금 징수를 발동하였습니다',
+  priceShift: () => '시세 변동을 발동하였습니다'
+};
 const cleanNick = v => String(v ?? '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 20) || '익명';
-async function recordDonation({ eventId, soopId, balloons, actor, donorNickname }) {
+// kind: 'balloon'(일반 별풍선) | 'battleMission'(대결미션 별풍선). 보상 규칙은 같다.
+const DONATION_KIND_TEXT = { balloon: '별풍선', battleMission: '대결미션 별풍선' };
+async function recordDonation({ eventId, soopId, balloons, actor, donorNickname, kind = 'balloon' }) {
+  if (!DONATION_KIND_TEXT[kind]) kind = 'balloon';
+  const kindText = DONATION_KIND_TEXT[kind];
   if (!eventId || eventId.length > 200 || !/^[A-Za-z0-9_.-]{2,100}$/.test(soopId) || !Number.isSafeInteger(balloons) || balloons <= 0 || balloons > 1000000) {
     return { status: 400, body: { ok: false, error: '후원 이벤트 데이터가 올바르지 않습니다.' } };
   }
   if (store.data.donations.some(d => d.eventId === eventId && d.soopId.toLowerCase() === soopId.toLowerCase())) return { status: 200, body: { ok: true, duplicate: true } };
   const streamer = store.data.streamers.find(s => s.active && !s.deleted && s.soopId && s.soopId.toLowerCase() === soopId.toLowerCase());
-  const donation = { id: crypto.randomUUID(), eventId, soopId, balloons, receivedAt: nowIso(), status: streamer ? 'RECORDED' : 'UNLINKED' };
+  const donation = { id: crypto.randomUUID(), eventId, soopId, balloons, kind, receivedAt: nowIso(), status: streamer ? 'RECORDED' : 'UNLINKED' };
   store.data.donations.unshift(donation);
   const rewards = streamer ? computeRewards(rules.get(), balloons) : [];
   for (const { rewardType, amount } of rewards) {
-    store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: 별풍선 ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: actor });
+    store.data.jobs.unshift({ id: crypto.randomUUID(), streamerId: streamer.id, soopId: streamer.soopId, farmerName: '', rewardType, amount, reason: `후원 자동 보상: ${kindText} ${balloons}개 (event ${eventId})`, source: 'donation', donationId: donation.id, status: 'PENDING', createdAt: nowIso(), updatedAt: nowIso(), attempts: 0, createdBy: actor });
   }
   if (streamer && donorNickname !== undefined) {
     const nick = cleanNick(donorNickname);
     for (const { rewardType, amount } of rewards) {
-      const [label, unit, verb] = REWARD_LABELS[rewardType] || [rewardType, '개', '획득하였습니다'];
-      pushLinkEvent(streamer, 'info', `${nick}님이 별풍선 ${balloons}개를 후원하여 ${label} ${amount}${unit}를 ${verb}.`);
+      const what = (REWARD_TEXT[rewardType] || (n => `${rewardType} ${n}개를 획득하였습니다`))(amount);
+      pushLinkEvent(streamer, 'info', `${nick}님이 ${kindText} ${balloons}개를 후원하여 ${what}.`);
     }
   }
-  await store.save(); await store.audit(actor, 'donation_received', { eventId, soopId, balloons, status: donation.status, rewards });
+  await store.save(); await store.audit(actor, 'donation_received', { eventId, soopId, balloons, kind, status: donation.status, rewards });
   return { status: 201, body: { ok: true, donationId: donation.id, status: donation.status, rewards } };
 }
 
@@ -356,17 +366,71 @@ app.post('/api/ingest/donation', async (req, res) => {
   res.status(r.status).json(r.body);
 });
 
+// ── 연동 해제 시 개인정보 삭제 (개인정보처리방침 6·7조) ─────────────────
+// 스트리머의 SOOP 아이디·닉네임·캐릭터 정보를 후원 기록, 작업, 감사 로그에서도 "(삭제됨)"으로 바꾼다.
+const DELETED = '(삭제됨)';
+// 이 스트리머를 가리키는 식별값: 현재 값 + 감사 로그에 남은 예전 값(닉네임 변경 전 등)
+function identifiersOf(s) {
+  const ids = new Set();
+  const add = v => { if (typeof v === 'string' && v.trim() && v !== DELETED) ids.add(v.trim()); };
+  add(s.soopId); add(s.nickname); add(s.farmerName); add(s.label);
+  for (const a of store.data.audit) {
+    const d = a.details;
+    if (!d || d.streamerId !== s.id) continue;
+    add(d.soopId); add(d.farmerName);
+    for (const side of [d.from, d.to]) { if (typeof side === 'string') add(side); else if (side) { add(side.soopId); add(side.nickname); } }
+  }
+  return ids;
+}
+const escapeRegExp = v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function scrubIdentifiers(s, ids) {
+  // 같은 사람이 다시 연동해 지금 쓰고 있는 값(다른 활성 스트리머의 아이디·닉네임)은 지우지 않는다.
+  const inUse = new Set();
+  for (const x of store.data.streamers) if (x !== s && !x.deleted) for (const v of [x.soopId, x.nickname, x.label, x.farmerName]) if (typeof v === 'string' && v.trim()) inUse.add(v.trim().toLowerCase());
+  const list = [...ids].filter(v => v.length >= 2 && !inUse.has(v.toLowerCase()));
+  // 아이디처럼 생긴 값(영문/숫자 4자 이상)은 'link:아이디' 같은 문자열 안에서도 지운다. 닉네임은 값 전체가 같을 때만 지운다.
+  const inner = list.filter(v => v.length >= 4 && /^[A-Za-z0-9_.-]+$/.test(v)).map(v => new RegExp(escapeRegExp(v), 'gi'));
+  const lower = new Set(list.map(v => v.toLowerCase()));
+  const scrub = v => {
+    if (typeof v === 'string') { if (lower.has(v.trim().toLowerCase())) return DELETED; return inner.reduce((t, re) => t.replace(re, DELETED), v); }
+    if (Array.isArray(v)) return v.map(scrub);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrub(x)]));
+    return v;
+  };
+  for (const a of store.data.audit) {
+    a.actor = scrub(a.actor);
+    a.details = scrub(a.details);
+    if (a.details && a.details.streamerId === s.id) for (const k of ['farmerId', 'farmerName']) if (k in a.details) a.details[k] = DELETED;
+  }
+  for (const j of store.data.jobs) {
+    Object.assign(j, scrub(j));   // soopId, createdBy('link:아이디'), streamerLabel 등
+    if (j.streamerId === s.id) { j.soopId = DELETED; j.farmerName = ''; }
+  }
+  for (const d of store.data.donations) Object.assign(d, scrub(d));
+}
+
 // 토큰과 개인정보를 지우고 대기 중인 작업은 확인 필요로 돌린다.
 async function unlinkStreamer(s, actor, reason) {
-  const removedSoopId = s.soopId || null;
   for (const j of store.data.jobs) {
     if (j.streamerId !== s.id) continue;
     if (['PENDING','RETRY','LEASED'].includes(j.status)) { j.status = 'REVIEW'; j.lastError = `연결 해제: ${reason}`; j.updatedAt = nowIso(); }
-    j.soopId = '(삭제됨)';
   }
-  if (removedSoopId) for (const d of store.data.donations) if (d.soopId.toLowerCase() === removedSoopId.toLowerCase()) d.soopId = '(삭제됨)';
-  Object.assign(s, { deleted: true, active: false, soopId: null, nickname: null, farmerName: null, soopAuth: null, linkKeyHash: null, linkInstance: null, loginTicketHash: null, sdkState: null, sdkError: null, unlinkedAt: nowIso() });
+  scrubIdentifiers(s, identifiersOf(s));
+  Object.assign(s, { deleted: true, active: false, soopId: null, nickname: null, farmerName: null, farmerId: null, label: null, soopAuth: null, linkKeyHash: null, linkInstance: null, loginTicketHash: null, sdkState: null, sdkError: null, lastActiveAt: null, unlinkedAt: nowIso() });
   await store.save(); await store.audit(actor, 'streamer_unlinked', { streamerId: s.id, reason });
+}
+
+// 예전 버전에서 해제된 스트리머의 남은 식별값을 한 번 정리한다 (시작할 때).
+async function scrubPreviouslyUnlinked() {
+  let n = 0;
+  for (const s of store.data.streamers.filter(x => x.deleted)) {
+    const ids = identifiersOf(s);
+    if (!ids.size && !s.farmerId && !s.label) continue;
+    scrubIdentifiers(s, ids);
+    Object.assign(s, { soopId: null, nickname: null, farmerName: null, farmerId: null, label: null, lastActiveAt: null });
+    n++;
+  }
+  if (n) { await store.save(); console.log(`[정리] 예전에 해제된 스트리머 ${n}명의 남은 식별 정보를 지웠습니다.`); }
 }
 
 // ── 게임 서버 모드 (AgentToken) ─────────────────────────────────────────
@@ -558,13 +622,20 @@ async function accessTokenFor(s) {
     await store.save(); await store.audit('soop', 'soop_token_refreshed', { streamerId: s.id });
     return t.accessToken;
   } catch (error) {
-    // 갱신이 안 되면(동의 철회 등) 토큰을 지우고 다시 로그인하게 한다 (이용약관 제11조 17항).
-    s.soopAuth = null;
-    pushLinkEvent(s, 'error', 'SOOP 로그인이 만료되었습니다. 후원을 계속 받으려면 /숲로그인을 다시 해 주세요.');
-    await store.save(); await store.audit('soop', 'soop_token_refresh_failed', { streamerId: s.id, error: error.message });
-    return null;
+    if (error.rejected) {
+      // SOOP이 갱신을 거절함(동의 철회, 토큰 폐기 등): /숲로그아웃과 같이 연동 정보를 모두 지운다
+      // (이용약관 제11조 17항, 개인정보처리방침 6조).
+      pushLinkEvent(s, 'error', 'SOOP 연결이 해제되었습니다 (동의 철회 또는 로그인 만료). 후원을 계속 받으려면 /숲로그인을 다시 해 주세요.');
+      await unlinkStreamer(s, 'soop', `SOOP 토큰 갱신 거절 (HTTP ${error.status})`);
+      return null;
+    }
+    // 네트워크 오류나 SOOP 서버 오류는 지우지 않고 다음 요청 때 다시 시도한다.
+    const last = refreshWarnAt.get(s.id) || 0;
+    if (Date.now() - last > 10 * 60 * 1000) { refreshWarnAt.set(s.id, Date.now()); console.warn(`[SOOP] 토큰 갱신 실패, 다시 시도합니다 (streamer ${s.id}): ${error.message}`); }
+    return Date.parse(s.soopAuth.expiresAt) > Date.now() ? tokenBox.open(s.soopAuth.access) : null;
   }
 }
+const refreshWarnAt = new Map();
 
 app.post('/api/link/session', async (req, res) => {
   const s = linkFromKey(req.body?.key);
@@ -641,7 +712,7 @@ app.post('/api/link/donation', async (req, res) => {
   if (!s.soopId) return fail(res, 409, '아직 방송 정보(SOOP ID)를 받지 못했습니다.');
   const bjId = String(req.body?.bjId || '').trim();
   if (bjId && bjId.toLowerCase() !== s.soopId.toLowerCase()) return fail(res, 403, `다른 방송(${bjId})의 후원입니다.`);
-  const r = await recordDonation({ eventId: String(req.body?.eventId || '').trim(), soopId: s.soopId, balloons: Number(req.body?.balloons), actor: `link:${s.soopId}`, donorNickname: String(req.body?.donorNickname ?? '') });
+  const r = await recordDonation({ eventId: String(req.body?.eventId || '').trim(), soopId: s.soopId, balloons: Number(req.body?.balloons), actor: `link:${s.soopId}`, donorNickname: String(req.body?.donorNickname ?? ''), kind: req.body?.kind === 'battleMission' ? 'battleMission' : 'balloon' });
   res.status(r.status).json(r.body);
 });
 
@@ -658,7 +729,18 @@ async function unlinkInactiveStreamers() {
   for (const s of stale) await unlinkStreamer(s, 'system', `${INACTIVE_UNLINK_DAYS}일 이상 접속하지 않아 자동 해제됨`);
   if (stale.length) console.log(`[정리] 장기 미접속 스트리머 ${stale.length}명의 연동 정보를 삭제했습니다.`);
 }
+scrubPreviouslyUnlinked().catch(e => console.error('[정리] 예전 해제 정보 정리 실패:', e.message));
 unlinkInactiveStreamers().catch(e => console.error('[정리] 장기 미접속 삭제 실패:', e.message));
+// 게임 서버가 가져가지 않은 알림(후원자 닉네임이 들어 있음)은 10분이 지나면 지운다 (개인정보처리방침 1·6조).
+setInterval(async () => {
+  let changed = false;
+  for (const g of store.data.gameServers) {
+    const before = (g.linkEvents || []).length;
+    g.linkEvents = (g.linkEvents || []).filter(e => Date.now() - Date.parse(e.at) < 10 * 60 * 1000);
+    if (g.linkEvents.length !== before) changed = true;
+  }
+  if (changed) await store.save().catch(e => console.error('[정리] 알림 정리 저장 실패:', e.message));
+}, 60 * 1000).unref();
 setInterval(() => unlinkInactiveStreamers().catch(e => console.error('[정리] 장기 미접속 삭제 실패:', e.message)), 6 * 60 * 60 * 1000).unref();
 
 app.listen(port, host, () => console.log(`[StardewSOOPBridge Central] listening on http://${host}:${port}; 인증 도메인: ${publicBaseUrl()} (config/central.json); admin page: /admin; health: /health`));
